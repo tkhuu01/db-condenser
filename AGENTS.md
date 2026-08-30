@@ -174,7 +174,7 @@ Named queries executed once at subset start, cached in memory, and applied as `A
 
 ### Incremental Re-Runs (Top-Up and Grow)
 
-When `destination_mode` is `"topup"` or `"grow"` (PostgreSQL only; default is `"recreate"`, and the deprecated `skip_schema_setup: true` maps to `"topup"`), the destination is treated as an existing subset and the run adds to it instead of re-transferring everything:
+When `destination_mode` is `"topup"` or `"grow"` (PostgreSQL only; default is `"recreate"`), the destination is treated as an existing subset and the run adds to it instead of re-transferring everything:
 
 - Destination FK constraints are dropped for the duration of the run (middle-out load order inserts referencing rows before referenced ones) and restored at the end; definitions are retained in `_condenser.fk_backup` and backed up to `SQL/incremental_fk_backup.sql`. PKs and unique indexes stay for conflict handling. Restoration failures fail the command.
 - Incremental inserts upsert using the resolved incremental identity from `_conflict_clause`: `ON CONFLICT (<identity>) DO UPDATE`, guarded by `IS DISTINCT FROM` so unchanged rows write nothing. The identity may be the primary key or an eligible unique key. Re-read rows therefore refresh in place (history `enddate`s, soft-delete flags). The COPY-protocol staging insert dedups on the resolved identity (`DISTINCT ON`) first, since one upsert statement cannot affect a row twice.

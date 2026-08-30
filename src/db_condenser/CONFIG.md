@@ -31,7 +31,8 @@ for the exact format.
 
 ## Required
 
-`db_type`: The type of the database to subset. Valid values are `"postgres"` or `"mysql"`.
+`db_type`: The type of the database to subset. Valid values are `"postgres"` or
+`"mysql"`. MySQL support targets the 8.4 LTS series or newer.
 
 `source_db_connection_info`: Source database connection details. A JSON object
 with the fields `user_name`, `host`, `db_name`, `port`, `ssl_mode` (optional),
@@ -149,14 +150,25 @@ With `"topup"` (Postgres only), the destination is treated as an existing
 subset and the run adds to it — for example, to add rows from different
 initial targets across multiple runs. Already-imported entities stay frozen:
 new source children of previously imported rows are not picked up. Re-runs
-cost O(new rows). The deprecated `skip_schema_setup: true` is equivalent to
-`"topup"`.
+cost O(new rows).
 
-With `"grow"` (Postgres only), the run does everything `"topup"` does and
-also picks up new children/descendants of already-imported rows, so the
-subset keeps tracking source growth. This re-reads the children of every
-resident parent (deduplicated on insert), so a run costs O(existing subset)
-rather than O(new rows).
+With `"grow"`, the run adds new direct targets and picks up new
+children/descendants of already-imported rows, so the subset keeps tracking
+source growth. This re-reads the children of every resident parent
+(deduplicated on insert), so a run costs O(existing subset) rather than O(new
+rows). PostgreSQL supports the full incremental contract described below.
+
+MySQL 8.4 currently supports a bounded `"grow"` mode when every table in the
+connected run scope has a primary key, source and destination column definitions
+and primary keys match, and the destination tables have no secondary unique
+indexes or enabled triggers. Re-read rows are refreshed and generated columns
+are recomputed. The run uses transient delta tables, takes a destination advisory
+lock, verifies foreign-key integrity before finishing, and can be retried
+idempotently. MySQL `"topup"`, `incremental_keys`, secondary unique indexes, and
+durable failure journals are not yet supported and fail during configuration or
+preflight.
+
+The remaining incremental details in this section describe PostgreSQL.
 
 In both incremental modes, any row the run re-reads is refreshed in place
 (upsert on its incremental identity): changed columns — soft-delete flags, history
@@ -167,7 +179,7 @@ index live. Rows the run never re-reads keep their old values, and rows
 hard-deleted in the source are never removed — if a hard-deleted row blocks
 a unique index that a replacement row needs, the run fails with a unique
 violation and a `"recreate"` run is the fix.
-By default, the incremental identity is the table's primary key.
+On PostgreSQL, the incremental identity defaults to the table's primary key.
 `incremental_keys` applies only to tables without a primary key and cannot
 override a table's primary key. A table with no primary key may use a unique
 index when it is valid, immediate, non-partial, non-expression, and all of its
@@ -202,8 +214,8 @@ OVERLAPS` constraints rather than loading them with unsafe semantics. Use
 `fk_augmentation` to describe history ownership that is logical but not backed
 by a physical foreign key.
 
-The destination is protected by an advisory lock. A failed run retains its
-`_condenser` delta journal and FK definitions, and the same effective
+The destination is protected by an advisory lock. On PostgreSQL, a failed run
+retains its `_condenser` delta journal and FK definitions, and the same effective
 configuration resumes it on the next run. A different configuration or
 identity selection is rejected until the original run is resumed or the
 destination is recreated. `SQL/incremental_fk_backup.sql` is also written as a

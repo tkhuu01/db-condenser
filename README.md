@@ -1,13 +1,13 @@
 # Database Condenser
 
-A config-driven database subsetting tool for PostgreSQL and MySQL, forked from
+A config-driven database subsetting tool for PostgreSQL and MySQL 8.4 LTS+, forked from
 Tonic's Condenser.
 
 Major changes from the original Condenser implementation:
 
 * Supports subsetting databases larger than 10 GB, which the original implementation struggled to process
 * Designed to run against read-only instances and replicas, reducing load on the primary database
-* Supports incremental top-ups, allowing existing subsets to grow without rebuilding the destination database
+* Supports PostgreSQL incremental top-ups and PostgreSQL/MySQL subset growth without rebuilding the destination database
 * Handles dense and complex FK relationship graphs
 * Uses concurrent worker pools throughout the subsetting process to improve performance
 * Postgres COPY protocol for faster transfer enabled by default
@@ -34,7 +34,7 @@ You can find more about the original Condenser details
 ## Requirements
 
 * Python 3.10+
-* Postgres 14+ 
+* Postgres 14+ and/or MySQL 8.4 LTS+
 
 ## Installation
 

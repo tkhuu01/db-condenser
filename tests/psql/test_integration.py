@@ -930,20 +930,11 @@ def test_incremental_report_handles_new_disconnected_source_table(capsys):
         _drop_test_databases(source_db, dest_db)
 
 
-def test_skip_schema_setup_alias_maps_to_destination_mode():
+def test_destination_mode_defaults_to_recreate():
     with open(CONFIG_JSON, "r") as fp:
         raw = json.load(fp)
     raw.pop("destination_mode", None)
 
-    raw["skip_schema_setup"] = True
-    cfg = config_reader._raw_dict_to_config(raw)
-    assert cfg.destination_mode == config_reader.DestinationMode.TOPUP
-
-    raw["skip_schema_setup"] = False
-    cfg = config_reader._raw_dict_to_config(raw)
-    assert cfg.destination_mode == config_reader.DestinationMode.RECREATE
-
-    del raw["skip_schema_setup"]
     cfg = config_reader._raw_dict_to_config(raw)
     assert cfg.destination_mode == config_reader.DestinationMode.RECREATE
 
@@ -964,20 +955,6 @@ def test_grow_mode_parses_and_is_incremental():
     assert not config_reader._raw_dict_to_config(raw).is_incremental
 
 
-def test_grow_mode_rejected_on_mysql():
-    with open(CONFIG_JSON, "r") as fp:
-        raw = json.load(fp)
-    raw["db_type"] = "mysql"
-
-    raw["destination_mode"] = "grow"
-    with pytest.raises(ValueError, match="grow"):
-        config_reader._raw_dict_to_config(raw)
-
-    # topup keeps its historical degraded-but-allowed behavior on MySQL
-    raw["destination_mode"] = "topup"
-    config_reader._raw_dict_to_config(raw)
-
-
 def test_incremental_keys_parse_and_validate():
     with open(CONFIG_JSON, "r") as fp:
         raw = json.load(fp)
@@ -994,11 +971,6 @@ def test_incremental_keys_parse_and_validate():
 
     raw["incremental_keys"] = [{"table": "sales.history", "columns": []}]
     with pytest.raises(ValueError, match="non-empty string list"):
-        config_reader._raw_dict_to_config(raw)
-
-    raw["incremental_keys"] = [{"table": "sales.history", "columns": ["history_id"]}]
-    raw["db_type"] = "mysql"
-    with pytest.raises(ValueError, match="only supported on PostgreSQL"):
         config_reader._raw_dict_to_config(raw)
 
 
@@ -2196,7 +2168,6 @@ def grow_batch_boundary_dbs():
     inserts (like the COPY path) for this grow run to succeed under the
     live partial unique index."""
     import db_condenser.psql_database_helper as helper_mod
-    import db_condenser.subset as subset_mod
 
     param = {
         "use_temp_tables": False,
@@ -2235,14 +2206,11 @@ def grow_batch_boundary_dbs():
     src.commit()
     src.close()
 
-    real_subset_batch = subset_mod.compute_batch_size
     real_helper_batch = helper_mod.compute_batch_size
-    subset_mod.compute_batch_size = lambda column_count: 2
     helper_mod.compute_batch_size = lambda column_count: 2
     try:
         _run_subsetter(**param, mode="grow")
     finally:
-        subset_mod.compute_batch_size = real_subset_batch
         helper_mod.compute_batch_size = real_helper_batch
 
     dest = psycopg.connect(
@@ -2835,7 +2803,7 @@ def multi_fk_batch_dbs():
     IDs, a streamed join that binds the same batch to both constraints drops
     every ring edge whose ends fall in different batches.
     """
-    import db_condenser.subset as subset_mod
+    import db_condenser.psql_database_helper as helper_mod
 
     source_db = SOURCE_DB + "_mfk"
     dest_db = DEST_DB + "_mfk"
@@ -2893,8 +2861,8 @@ def multi_fk_batch_dbs():
     config_reader.config = config_reader._raw_dict_to_config(raw_config)
     config = config_reader.get_config()
 
-    real_batch_size = subset_mod.compute_batch_size
-    subset_mod.compute_batch_size = lambda column_count: 2
+    real_batch_size = helper_mod.compute_batch_size
+    helper_mod.compute_batch_size = lambda column_count: 2
     try:
         source_dbc = DbConnect(config.db_type, config.source_db_connection_info)
         destination_dbc = DbConnect(
@@ -2913,7 +2881,7 @@ def multi_fk_batch_dbs():
             subsetter.unprep_temp_dbs()
             subsetter.close_connections()
     finally:
-        subset_mod.compute_batch_size = real_batch_size
+        helper_mod.compute_batch_size = real_batch_size
 
     dest = psycopg.connect(
         dbname=dest_db,

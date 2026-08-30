@@ -51,6 +51,38 @@ _incremental_deltas: dict = {}
 _secondary_unique_tables: set = set()
 
 
+def get_batch_size(column_count: int) -> int:
+    return compute_batch_size(column_count)
+
+
+def validate_supported_version(conn):
+    pass
+
+
+def requires_distinct_id_temp_tables() -> bool:
+    return False
+
+
+def build_id_table(rows, columns, datatypes, alias):
+    """Render a typed table-valued parameter for a batch of identity rows."""
+    unnest_args = ", ".join("%s::{}[]".format(datatypes[col]) for col in columns)
+    join_cols = ", ".join("col{}".format(i) for i in range(len(columns)))
+    params = [[row[i] for row in rows] for i in range(len(columns))]
+    return "unnest({}) AS {}({})".format(unnest_args, alias, join_cols), params
+
+
+def iter_membership_batches(values):
+    yield values
+
+
+def build_membership_filter(column_sql, values):
+    return "{} = ANY(%s)".format(column_sql), [values]
+
+
+def temp_table_column(temp_table, index, datatype):
+    return "{}.col{}::{}".format(fully_qualified_table(temp_table), index, datatype)
+
+
 def _prefixed_identifier(prefix, qualified_table):
     """Build '<prefix><schema>_<table>', hashing when it would exceed
     Postgres's 63-byte identifier limit (which truncates silently and could

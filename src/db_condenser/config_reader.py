@@ -175,10 +175,13 @@ class Config:
         ):
             raise ValueError("parallel_read_workers must be an integer >= 1")
         if (
-            self.destination_mode == DestinationMode.GROW
-            and self.db_type != DbType.POSTGRES
+            self.db_type == DbType.MYSQL
+            and self.destination_mode == DestinationMode.TOPUP
         ):
-            raise ValueError('destination_mode "grow" is only supported on PostgreSQL')
+            raise ValueError(
+                'destination_mode "topup" is not yet supported on MySQL; '
+                'use "grow" for primary-key tables'
+            )
         if self.incremental_keys and self.db_type != DbType.POSTGRES:
             raise ValueError("incremental_keys are only supported on PostgreSQL")
         key_tables = [key.table for key in self.incremental_keys]
@@ -280,15 +283,9 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     max_rows_per_table = raw_config.get("max_rows_per_table", None)
     use_temp_tables = bool(raw_config.get("use_temp_tables", False))
     use_copy_protocol = bool(raw_config.get("use_copy_protocol", True))
-    mode_raw = raw_config.get("destination_mode")
-    if mode_raw is None and "skip_schema_setup" in raw_config:
-        print(
-            "WARNING: 'skip_schema_setup' is deprecated; use"
-            ' "destination_mode": "topup" (true) or "recreate" (false) instead.',
-            file=sys.stderr,
-        )
-        mode_raw = "topup" if raw_config["skip_schema_setup"] else "recreate"
-    destination_mode = DestinationMode((mode_raw or "recreate").lower())
+    destination_mode = DestinationMode(
+        (raw_config.get("destination_mode") or "recreate").lower()
+    )
     parallel_read_workers = int(raw_config.get("parallel_read_workers", 1))
     pre_filters = [PreFilter(**pf) for pf in raw_config.get("pre_filters", [])]
     return Config(

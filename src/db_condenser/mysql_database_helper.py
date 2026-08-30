@@ -1,3 +1,5 @@
+import hashlib
+import re
 import uuid
 from dataclasses import asdict
 
@@ -26,31 +28,361 @@ system_schemas_str = ",".join(
     ]
 )
 temp_db = "tonic_subset_temp_db_398dhjr23"
+_incremental_deltas = {}
+_incremental_lock_name = None
 
 
 def prep_temp_dbs(source_conn, destination_conn):
-    run_query("DROP DATABASE IF EXISTS " + temp_db, source_conn)
-    run_query("DROP DATABASE IF EXISTS " + temp_db, destination_conn)
-    run_query("CREATE DATABASE IF NOT EXISTS " + temp_db, source_conn)
-    run_query("CREATE DATABASE IF NOT EXISTS " + temp_db, destination_conn)
+    pass
 
 
 def unprep_temp_dbs(source_conn, destination_conn):
-    run_query("DROP DATABASE IF EXISTS " + temp_db, source_conn)
-    run_query("DROP DATABASE IF EXISTS " + temp_db, destination_conn)
+    pass
+
+
+def get_batch_size(column_count: int) -> int:
+    # Keep generated parameter lists below MySQL's 65,535 placeholder limit.
+    return max(1, min(1000, 60_000 // max(column_count, 1)))
+
+
+def validate_supported_version(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT VERSION()")
+        version = cur.fetchone()[0]
+    match = re.match(r"^(\d+)\.(\d+)", version)
+    if "mariadb" in version.lower() or match is None:
+        raise RuntimeError("Unsupported MySQL server version: {}".format(version))
+    if tuple(map(int, match.groups())) < (8, 4):
+        raise RuntimeError(
+            "MySQL 8.4 LTS or newer is required; source is {}".format(version)
+        )
+
+
+def requires_distinct_id_temp_tables() -> bool:
+    # MySQL error 1137 prevents reopening one temporary table under multiple
+    # aliases in the same query.
+    return True
+
+
+def build_id_table(rows, columns, datatypes, alias):
+    """Render identity rows as a derived table without writing to the source."""
+    selects = []
+    params = []
+    for row_index, row in enumerate(rows):
+        if len(row) != len(columns):
+            raise ValueError("identity row does not match its column count")
+        select_columns = []
+        for column_index, value in enumerate(row):
+            placeholder = "%s"
+            if row_index == 0:
+                placeholder += " AS col{}".format(column_index)
+            select_columns.append(placeholder)
+            params.append(value)
+        selects.append("SELECT " + ", ".join(select_columns))
+    if not selects:
+        empty_columns = ", ".join(
+            "NULL AS col{}".format(i) for i in range(len(columns))
+        )
+        selects.append("SELECT {} WHERE FALSE".format(empty_columns))
+    return "({}) AS {}".format(" UNION ALL ".join(selects), alias), params
+
+
+def iter_membership_batches(values):
+    batch_size = get_batch_size(1)
+    for start in range(0, len(values), batch_size):
+        yield values[start : start + batch_size]
+
+
+def build_membership_filter(column_sql, values):
+    placeholders = ", ".join(["%s"] * len(values))
+    return "{} IN ({})".format(column_sql, placeholders), list(values)
+
+
+def temp_table_column(temp_table, index, datatype):
+    # MySQL coerces the temporary TEXT value to the indexed source column's
+    # type for equality comparison. Keeping the source expression uncast lets
+    # the optimizer continue to use its index.
+    return "{}.col{}".format(fully_qualified_table(temp_table), index)
 
 
 def turn_off_constraints(connection):
     cur = connection.cursor()
     try:
         cur.execute("SET UNIQUE_CHECKS=0, FOREIGN_KEY_CHECKS=0;")
+        cur.execute("SELECT @@SESSION.sql_mode")
+        sql_modes = [mode for mode in cur.fetchone()[0].split(",") if mode]
+        if "NO_AUTO_VALUE_ON_ZERO" not in sql_modes:
+            sql_modes.append("NO_AUTO_VALUE_ON_ZERO")
+            cur.execute("SET SESSION sql_mode = %s", (",".join(sql_modes),))
     finally:
         cur.close()
 
 
+def _source_table_for_destination(destination_table):
+    config = get_config()
+    if schema_name(destination_table) == config.destination_db_connection_info.db_name:
+        return "{}.{}".format(
+            config.source_db_connection_info.db_name,
+            table_name(destination_table),
+        )
+    return destination_table
+
+
+def _primary_key_columns(conn, schema, table):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name FROM information_schema.key_column_usage "
+            "WHERE table_schema = %s AND table_name = %s "
+            "AND constraint_name = 'PRIMARY' ORDER BY ordinal_position",
+            (schema, table),
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def _column_metadata(conn, schema, table):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT column_name, column_type, is_nullable, column_default, extra, "
+            "generation_expression, collation_name "
+            "FROM information_schema.columns "
+            "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
+            (schema, table),
+        )
+        return cur.fetchall()
+
+
+def _acquire_incremental_lock(conn):
+    global _incremental_lock_name
+    destination = get_config().destination_db_connection_info.db_name
+    digest = hashlib.sha256(destination.encode()).hexdigest()[:32]
+    _incremental_lock_name = "db-condenser:grow:" + digest
+    with conn.cursor() as cur:
+        cur.execute("SELECT GET_LOCK(%s, 0)", (_incremental_lock_name,))
+        acquired = cur.fetchone()[0]
+    if acquired != 1:
+        _incremental_lock_name = None
+        raise RuntimeError(
+            "Another incremental db-condenser run is active for this destination"
+        )
+
+
+def _release_incremental_lock(conn):
+    global _incremental_lock_name
+    if _incremental_lock_name is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT RELEASE_LOCK(%s)", (_incremental_lock_name,))
+            cur.fetchone()
+    finally:
+        _incremental_lock_name = None
+
+
+def prep_incremental(source_conn, destination_conn, tables):
+    _incremental_deltas.clear()
+    _acquire_incremental_lock(destination_conn)
+    config = get_config()
+    destination_schema = config.destination_db_connection_info.db_name
+    validated = []
+    try:
+        for source_table in tables:
+            source_schema = schema_name(source_table)
+            name = table_name(source_table)
+            source_key = _primary_key_columns(source_conn, source_schema, name)
+            destination_key = _primary_key_columns(
+                destination_conn, destination_schema, name
+            )
+            if not source_key or not destination_key:
+                raise ValueError(
+                    "MySQL grow requires a primary key on {} in both source and "
+                    "destination".format(source_table)
+                )
+            if source_key != destination_key:
+                raise ValueError(
+                    "Source and destination primary keys differ for {}".format(
+                        source_table
+                    )
+                )
+            if _column_metadata(source_conn, source_schema, name) != _column_metadata(
+                destination_conn, destination_schema, name
+            ):
+                raise ValueError(
+                    "Source and destination columns differ for {}".format(source_table)
+                )
+            with destination_conn.cursor() as cur:
+                cur.execute(
+                    "SELECT index_name FROM information_schema.statistics "
+                    "WHERE table_schema = %s AND table_name = %s "
+                    "AND non_unique = 0 AND index_name <> 'PRIMARY' LIMIT 1",
+                    (destination_schema, name),
+                )
+                secondary_unique = cur.fetchone()
+                cur.execute(
+                    "SELECT trigger_name FROM information_schema.triggers "
+                    "WHERE trigger_schema = %s AND event_object_table = %s LIMIT 1",
+                    (destination_schema, name),
+                )
+                trigger = cur.fetchone()
+            if secondary_unique:
+                raise ValueError(
+                    "MySQL grow does not yet support secondary unique index {} on {}".format(
+                        secondary_unique[0], source_table
+                    )
+                )
+            if trigger:
+                raise ValueError(
+                    "MySQL grow cannot safely write {} while destination trigger {} "
+                    "is enabled".format(source_table, trigger[0])
+                )
+            validated.append((source_table, name, source_key))
+
+        for source_table, name, key in validated:
+            digest = hashlib.sha256(source_table.encode()).hexdigest()[:24]
+            delta_table = fully_qualified_table("tonic_grow_delta_" + digest)
+            destination_table = fully_qualified_table(
+                "{}.{}".format(destination_schema, name)
+            )
+            with destination_conn.cursor() as cur:
+                cur.execute(
+                    "CREATE TEMPORARY TABLE {} AS SELECT {}, FALSE AS _inserted "
+                    "FROM {} LIMIT 0".format(
+                        delta_table, columns_joined(key), destination_table
+                    )
+                )
+                cur.execute(
+                    "ALTER TABLE {} MODIFY _inserted BOOLEAN NOT NULL, "
+                    "ADD PRIMARY KEY ({})".format(delta_table, columns_joined(key))
+                )
+            _incremental_deltas[source_table] = (delta_table, key)
+        destination_conn.commit()
+    except BaseException:
+        destination_conn.connection.rollback()
+        _incremental_deltas.clear()
+        _release_incremental_lock(destination_conn)
+        raise
+
+
+def unprep_incremental(conn):
+    try:
+        with conn.cursor() as cur:
+            for delta_table, _ in _incremental_deltas.values():
+                cur.execute("DROP TEMPORARY TABLE IF EXISTS {}".format(delta_table))
+        conn.commit()
+    finally:
+        _incremental_deltas.clear()
+        _release_incremental_lock(conn)
+
+
+def retain_incremental(conn):
+    # MySQL grow scans every resident parent again, so a failed run can be
+    # retried safely without retaining its transient delta tables.
+    _incremental_deltas.clear()
+    _release_incremental_lock(conn)
+
+
+def delta_for(table):
+    return _incremental_deltas.get(table)
+
+
+def has_secondary_unique(table):
+    return False
+
+
+def drop_fk_constraints(conn):
+    # FOREIGN_KEY_CHECKS is already disabled for this destination session.
+    return []
+
+
+def restore_fk_constraints(conn, _constraints):
+    schema = get_config().destination_db_connection_info.db_name
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT constraint_name, table_name, referenced_table_schema, "
+            "referenced_table_name, "
+            "GROUP_CONCAT(column_name ORDER BY ordinal_position), "
+            "GROUP_CONCAT(referenced_column_name ORDER BY ordinal_position) "
+            "FROM information_schema.key_column_usage "
+            "WHERE constraint_schema = %s AND referenced_table_name IS NOT NULL "
+            "GROUP BY constraint_name, table_name, referenced_table_schema, "
+            "referenced_table_name",
+            (schema,),
+        )
+        relationships = cur.fetchall()
+        for (
+            constraint,
+            child,
+            parent_schema,
+            parent,
+            child_raw,
+            parent_raw,
+        ) in relationships:
+            child_columns = child_raw.split(",")
+            parent_columns = parent_raw.split(",")
+            child_table = fully_qualified_table("{}.{}".format(schema, child))
+            parent_table = fully_qualified_table("{}.{}".format(parent_schema, parent))
+            nonnull = " AND ".join(
+                "_fk.{} IS NOT NULL".format(quoter(column)) for column in child_columns
+            )
+            matches = " AND ".join(
+                "_pk.{} = _fk.{}".format(quoter(pk), quoter(fk))
+                for fk, pk in zip(child_columns, parent_columns)
+            )
+            cur.execute(
+                "SELECT EXISTS (SELECT 1 FROM {} _fk WHERE {} "
+                "AND NOT EXISTS (SELECT 1 FROM {} _pk WHERE {}))".format(
+                    child_table, nonnull, parent_table, matches
+                )
+            )
+            if cur.fetchone()[0]:
+                raise RuntimeError(
+                    "Cannot finish MySQL grow: foreign key {} on {} has orphaned "
+                    "rows".format(constraint, child_table)
+                )
+        cur.execute("SET UNIQUE_CHECKS=1, FOREIGN_KEY_CHECKS=1")
+    conn.commit()
+
+
 def copy_rows(
-    source, destination, query, destination_table, params=None, batch_size=1000
+    source,
+    destination,
+    query,
+    destination_table,
+    params=None,
+    batch_size=1000,
+    row_filter=None,
 ):
+    datatypes = get_table_datatypes(
+        table_name(destination_table), schema_name(destination_table), destination
+    )
+    generated_positions = {i for i, datatype in enumerate(datatypes) if datatype[2]}
+    insert_columns = [datatype[0] for datatype in datatypes if not datatype[2]]
+    if not insert_columns:
+        raise ValueError("Table {} has no insertable columns".format(destination_table))
+    column_list = columns_joined(insert_columns)
+    template = ",".join(["%s"] * len(insert_columns))
+    source_table = _source_table_for_destination(destination_table)
+    delta = _incremental_deltas.get(source_table)
+    identity = delta[1] if delta else []
+    update_columns = [column for column in insert_columns if column not in identity]
+    if delta and update_columns:
+        updates = ", ".join(
+            "{0} = _incoming.{0}".format(quoter(column)) for column in update_columns
+        )
+        duplicate_clause = " AS _incoming ON DUPLICATE KEY UPDATE " + updates
+    else:
+        duplicate_column = quoter(identity[0] if identity else insert_columns[0])
+        duplicate_clause = " ON DUPLICATE KEY UPDATE {} = {}".format(
+            duplicate_column, duplicate_column
+        )
+    insert_query = "INSERT INTO {} ({}) VALUES ({}){}".format(
+        fully_qualified_table(destination_table),
+        column_list,
+        template,
+        duplicate_clause,
+    )
+    identity_positions = (
+        [insert_columns.index(column) for column in identity] if delta else []
+    )
     cursor = source.cursor()
 
     try:
@@ -59,18 +391,43 @@ def copy_rows(
             rows = cursor.fetchmany(batch_size)
             if len(rows) == 0:
                 break
+            fetched_count = len(rows)
 
-            template = ",".join(["%s"] * len(rows[0]))
-            destination_cursor = destination.cursor()
-            insert_query = "INSERT INTO {} VALUES ({})".format(
-                fully_qualified_table(destination_table), template
-            )
-            destination_cursor.executemany(insert_query, rows)
+            if row_filter is not None:
+                rows = row_filter(rows)
 
-            destination_cursor.close()
-            destination.commit()
+            if generated_positions:
+                rows = [
+                    tuple(
+                        value
+                        for index, value in enumerate(row)
+                        if index not in generated_positions
+                    )
+                    for row in rows
+                ]
+            if rows:
+                destination_cursor = destination.cursor()
+                try:
+                    destination_cursor.executemany(insert_query, rows)
+                    if delta:
+                        delta_rows = [
+                            tuple(row[position] for position in identity_positions)
+                            for row in rows
+                        ]
+                        delta_insert = (
+                            "INSERT INTO {} ({}, _inserted) VALUES ({}, TRUE) "
+                            "ON DUPLICATE KEY UPDATE _inserted = TRUE"
+                        ).format(
+                            delta[0],
+                            columns_joined(identity),
+                            ",".join(["%s"] * len(identity)),
+                        )
+                        destination_cursor.executemany(delta_insert, delta_rows)
+                finally:
+                    destination_cursor.close()
+                destination.commit()
 
-            if len(rows) < batch_size:
+            if fetched_count < batch_size:
                 # necessary because mysql doesn't behave if you fetchmany after the last row
                 break
     except Exception as e:
@@ -89,12 +446,12 @@ def copy_rows(
 
 
 def create_id_temp_table(conn, number_of_columns):
-    temp_table = temp_db + "." + str(uuid.uuid4())
+    temp_table = "tonic_subset_" + str(uuid.uuid4()).replace("-", "")
     with conn.cursor() as cursor:
         column_defs = ",\n".join(
             ["    col" + str(aye) + "  text" for aye in range(number_of_columns)]
         )
-        q = "CREATE TABLE {} (\n {} \n)".format(
+        q = "CREATE TEMPORARY TABLE {} (\n {} \n)".format(
             fully_qualified_table(temp_table), column_defs
         )
         cursor.execute(q)

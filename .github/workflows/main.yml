@@ -16,7 +16,7 @@ jobs:
       - name: Ruff Lint
         uses: astral-sh/ruff-action@v3.5.1
 
-  test:
+  postgres-test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -44,4 +44,32 @@ jobs:
           docker cp "$PG_CONTAINER":/usr/lib/postgresql/$PG_VERSION/bin/pg_restore /usr/local/bin/pg_restore
       - uses: astral-sh/setup-uv@v6
       - run: uv sync
-      - run: uv run pytest tests/ -v
+      - run: uv run pytest tests/psql -v
+
+  mysql-test:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: test
+          MYSQL_ROOT_HOST: "%"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -ptest"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Copy matching MySQL client tools from service container
+        run: |
+          MYSQL_CONTAINER=$(docker ps -q -f "ancestor=mysql:8.4")
+          docker cp "$MYSQL_CONTAINER":/usr/bin/mysql /usr/local/bin/mysql
+          docker cp "$MYSQL_CONTAINER":/usr/bin/mysqldump /usr/local/bin/mysqldump
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - run: uv run pytest tests/mysql -v
+        env:
+          MYSQL_PATH: /usr/local/bin
