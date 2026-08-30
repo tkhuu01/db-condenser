@@ -39,3 +39,10 @@ def test_mysql_rejects_incremental_keys():
 
     with pytest.raises(ValueError, match="only supported on PostgreSQL"):
         config_reader._raw_dict_to_config(raw)
+
+
+def test_all_row_limit_is_normalized_to_unlimited():
+    raw = _raw_config()
+    raw["max_rows_per_table"] = "ALL"
+
+    assert config_reader._raw_dict_to_config(raw).max_rows_per_table is None

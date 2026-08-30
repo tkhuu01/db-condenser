@@ -101,6 +101,19 @@ def main():
 
     destination_dbc = DbConnect(db_type, dest_info, verbose=args.verbose)
 
+    db_helper = database_helper.get_specific_helper()
+    if db_type == DbType.MYSQL:
+        source_conn = source_dbc.get_db_connection()
+        try:
+            db_helper.validate_supported_version(source_conn)
+        finally:
+            source_conn.close()
+        destination_conn = destination_dbc.get_server_connection()
+        try:
+            db_helper.validate_supported_version(destination_conn)
+        finally:
+            destination_conn.close()
+
     database = db_creator(db_type, source_dbc, destination_dbc)
 
     if config.destination_mode == DestinationMode.RECREATE:
@@ -108,7 +121,6 @@ def main():
         database.create()
 
     # Get list of tables to operate on
-    db_helper = database_helper.get_specific_helper()
     all_tables = db_helper.list_all_tables(source_dbc)
     all_tables = [x for x in all_tables if x not in config.excluded_tables]
 
@@ -160,6 +172,11 @@ def main():
         result_tabulator.tabulate(
             source_dbc, destination_dbc, all_tables, total_elapsed
         )
+        if (
+            db_type == DbType.MYSQL
+            and config.destination_mode == DestinationMode.RECREATE
+        ):
+            database.enable_events()
         succeeded = True
     except KeyboardInterrupt:
         print("\nInterrupted — closing connections...")

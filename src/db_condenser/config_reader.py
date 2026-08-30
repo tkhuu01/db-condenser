@@ -281,6 +281,8 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     pre_constraint_sql = [sql for sql in raw_config.get("pre_constraint_sql", [])]
     post_subset_sql = [sql for sql in raw_config.get("post_subset_sql", [])]
     max_rows_per_table = raw_config.get("max_rows_per_table", None)
+    if max_rows_per_table == "ALL":
+        max_rows_per_table = None
     use_temp_tables = bool(raw_config.get("use_temp_tables", False))
     use_copy_protocol = bool(raw_config.get("use_copy_protocol", True))
     destination_mode = DestinationMode(

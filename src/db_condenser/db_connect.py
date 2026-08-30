@@ -75,17 +75,18 @@ class PsqlConnection(DbConnection):
 # small wrapper to the connection class that gives us a common interface to the cursor()
 # method across MySQL and Postgres. This one is for MySQL
 class MySqlConnection(DbConnection):
-    def __init__(self, connect, read_repeatable, verbose=False):
-        DbConnection.__init__(
-            self,
-            mysql.connector.connect(
-                host=connect.host,
-                port=connect.port,
-                user=connect.user,
-                password=connect.password,
-                database=connect.db_name,
-            ),
+    def __init__(
+        self, connect, read_repeatable, verbose=False, connect_to_database=True
+    ):
+        connection_args = dict(
+            host=connect.host,
+            port=connect.port,
+            user=connect.user,
+            password=connect.password,
         )
+        if connect_to_database:
+            connection_args["database"] = connect.db_name
+        DbConnection.__init__(self, mysql.connector.connect(**connection_args))
 
         self.db_name = connect.db_name
         self._verbose = verbose
@@ -124,3 +125,8 @@ class DbConnect:
             return MySqlConnection(self, read_repeatable, self._verbose)
         else:
             raise ValueError("unknown db_type " + self.__db_type)
+
+    def get_server_connection(self) -> MySqlConnection:
+        if self.__db_type != DbType.MYSQL:
+            raise ValueError("server-level connections are only supported for MySQL")
+        return MySqlConnection(self, False, self._verbose, connect_to_database=False)

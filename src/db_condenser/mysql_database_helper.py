@@ -54,7 +54,7 @@ def validate_supported_version(conn):
         raise RuntimeError("Unsupported MySQL server version: {}".format(version))
     if tuple(map(int, match.groups())) < (8, 4):
         raise RuntimeError(
-            "MySQL 8.4 LTS or newer is required; source is {}".format(version)
+            "MySQL 8.4 LTS or newer is required; server is {}".format(version)
         )
 
 
@@ -445,16 +445,42 @@ def copy_rows(
         cursor.close()
 
 
-def create_id_temp_table(conn, number_of_columns):
+def create_id_temp_table(
+    conn, number_of_columns, destination_table=None, destination_columns=None
+):
     temp_table = "tonic_subset_" + str(uuid.uuid4()).replace("-", "")
     with conn.cursor() as cursor:
-        column_defs = ",\n".join(
-            ["    col" + str(aye) + "  text" for aye in range(number_of_columns)]
-        )
-        q = "CREATE TEMPORARY TABLE {} (\n {} \n)".format(
-            fully_qualified_table(temp_table), column_defs
-        )
-        cursor.execute(q)
+        if destination_table is None:
+            column_defs = ",\n".join(
+                ["    col" + str(aye) + "  text" for aye in range(number_of_columns)]
+            )
+            cursor.execute(
+                "CREATE TEMPORARY TABLE {} (\n {} \n)".format(
+                    fully_qualified_table(temp_table), column_defs
+                )
+            )
+        else:
+            selected = ",".join(
+                "IF(TRUE, {}, NULL) AS {}".format(
+                    quoter(column), quoter("col" + str(index))
+                )
+                for index, column in enumerate(destination_columns)
+            )
+            id_columns = ["col" + str(index) for index in range(number_of_columns)]
+            cursor.execute(
+                "CREATE TEMPORARY TABLE {} AS SELECT {} FROM {} LIMIT 0".format(
+                    fully_qualified_table(temp_table),
+                    selected,
+                    fully_qualified_table(destination_table),
+                )
+            )
+            cursor.execute(
+                "CREATE INDEX {} ON {} ({})".format(
+                    quoter("tonic_subset_ids"),
+                    fully_qualified_table(temp_table),
+                    ",".join(quoter(column) for column in id_columns),
+                )
+            )
     return temp_table
 
 

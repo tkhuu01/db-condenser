@@ -289,6 +289,7 @@ def _run_mysql_subset(
     *,
     passthrough_tables=None,
     keep_disconnected_tables=False,
+    max_rows_per_table=None,
 ):
     source_info = DbConnectInfo(
         user_name=MYSQL_USER,
@@ -311,6 +312,7 @@ def _run_mysql_subset(
         destination_db_connection_info=destination_info,
         passthrough_tables=passthrough_tables or [],
         keep_disconnected_tables=keep_disconnected_tables,
+        max_rows_per_table=max_rows_per_table,
     )
     source_dbc = DbConnect(DbType.MYSQL, source_info)
     destination_dbc = DbConnect(DbType.MYSQL, destination_info)
@@ -609,9 +611,16 @@ def test_mysql_grow_rejects_tables_without_primary_keys(mysql_databases):
     )
 
 
-@pytest.mark.parametrize("target_table", ["stream_parents", "stream_children"])
+@pytest.mark.parametrize(
+    ("target_table", "max_rows_per_table"),
+    [
+        ("stream_parents", None),
+        ("stream_children", None),
+        ("stream_parents", 1001),
+    ],
+)
 def test_mysql_streams_more_than_one_destination_id_batch(
-    target_table, mysql_databases
+    target_table, max_rows_per_table, mysql_databases
 ):
     source_db, destination_db = mysql_databases
     conn = _server_connection()
@@ -642,6 +651,7 @@ def test_mysql_streams_more_than_one_destination_id_batch(
         source_db,
         destination_db,
         [InitialTarget(table=source_db + "." + target_table, where="TRUE")],
+        max_rows_per_table=max_rows_per_table,
     )
 
     assert _table_count(destination_db, "stream_parents") == 1001
@@ -655,23 +665,28 @@ def test_mysql_downstream_keyset_pages_composite_text_ids(mysql_databases, monke
         for database in (source_db, destination_db):
             cur.execute(
                 "CREATE TABLE `{}`.composite_parents ("
-                "code VARCHAR(20) NOT NULL, version INT NOT NULL, "
+                "code VARCHAR(20) COLLATE utf8mb4_bin NOT NULL, "
+                "version INT NOT NULL, "
                 "PRIMARY KEY (code, version))".format(database)
             )
             cur.execute(
                 "CREATE TABLE `{}`.composite_children ("
-                "id INT PRIMARY KEY, parent_code VARCHAR(20) NOT NULL, "
+                "id INT PRIMARY KEY, "
+                "parent_code VARCHAR(20) COLLATE utf8mb4_bin NOT NULL, "
                 "parent_version INT NOT NULL, "
                 "FOREIGN KEY (parent_code, parent_version) "
                 "REFERENCES composite_parents(code, version))".format(database)
             )
         cur.execute(
             "INSERT INTO `{}`.composite_parents VALUES "
-            "('zeta', 2), ('alpha', 10), ('alpha', 2)".format(source_db)
+            "('zeta', 2), ('alpha', 10), ('alpha', 2), ('A', 1), ('a', 1)".format(
+                source_db
+            )
         )
         cur.execute(
             "INSERT INTO `{}`.composite_children VALUES "
-            "(1, 'zeta', 2), (2, 'alpha', 10), (3, 'alpha', 2)".format(source_db)
+            "(1, 'zeta', 2), (2, 'alpha', 10), (3, 'alpha', 2), "
+            "(4, 'A', 1), (5, 'a', 1)".format(source_db)
         )
     conn.commit()
     conn.close()
@@ -696,7 +711,13 @@ def test_mysql_downstream_keyset_pages_composite_text_ids(mysql_databases, monke
         cur.execute(
             "SELECT code, version FROM composite_parents ORDER BY code, version"
         )
-        assert cur.fetchall() == [("alpha", 2), ("alpha", 10), ("zeta", 2)]
+        assert cur.fetchall() == [
+            ("A", 1),
+            ("a", 1),
+            ("alpha", 2),
+            ("alpha", 10),
+            ("zeta", 2),
+        ]
     conn.close()
 
 

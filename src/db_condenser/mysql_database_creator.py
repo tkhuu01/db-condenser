@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 
 _SCHEMA_DUMP_OPTIONS = (
@@ -10,11 +11,40 @@ _SCHEMA_DUMP_OPTIONS = (
     "--set-gtid-purged=OFF",
 )
 
+_EVENT_DECLARATION = re.compile(
+    rb"^/\*!50106 CREATE\*/[^\r\n]*?/\*!50106 EVENT `", re.MULTILINE
+)
+_EVENT_STATUS = re.compile(
+    rb"^(?P<prefix>/\*!50106 CREATE\*/[^\r\n]*?/\*!50106 EVENT "
+    rb"`(?P<name>(?:``|[^`])+)`[^\r\n]*? ON COMPLETION (?:NOT )?PRESERVE )"
+    rb"(?P<status>ENABLE|DISABLE(?: ON (?:REPLICA|SLAVE))?)\b",
+    re.MULTILINE,
+)
+
+
+def _disable_enabled_events(schema):
+    event_count = len(_EVENT_DECLARATION.findall(schema))
+    enabled_events = []
+
+    def disable(match):
+        if match.group("status") != b"ENABLE":
+            return match.group(0)
+        enabled_events.append(match.group("name").replace(b"``", b"`").decode("utf-8"))
+        return match.group("prefix") + b"DISABLE"
+
+    schema, parsed_count = _EVENT_STATUS.subn(disable, schema)
+    if parsed_count != event_count:
+        raise RuntimeError(
+            "Could not safely disable all MySQL event definitions in the schema dump"
+        )
+    return schema, enabled_events
+
 
 class MySqlDatabaseCreator:
     def __init__(self, source_connect, destination_connect):
         self.source_dbc = source_connect
         self.destination_dbc = destination_connect
+        self._events_to_enable = []
 
     def create(self):
         schema = self._run_command(
@@ -27,6 +57,7 @@ class MySqlDatabaseCreator:
             "Capturing schema failed",
             stdout=subprocess.PIPE,
         ).stdout
+        schema, self._events_to_enable = _disable_enabled_events(schema)
 
         self.run_query_on_destination(
             "CREATE DATABASE {}".format(_quote_identifier(self.destination_dbc.db_name))
@@ -41,6 +72,19 @@ class MySqlDatabaseCreator:
             input=schema,
             stdout=subprocess.DEVNULL,
         )
+
+    def enable_events(self):
+        if not self._events_to_enable:
+            return
+        statements = ";".join(
+            "ALTER EVENT {}.{} ENABLE".format(
+                _quote_identifier(self.destination_dbc.db_name),
+                _quote_identifier(event),
+            )
+            for event in self._events_to_enable
+        )
+        self.run_query_on_destination(statements)
+        self._events_to_enable = []
 
     def teardown(self):
         self.run_query_on_destination(

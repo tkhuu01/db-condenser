@@ -49,6 +49,47 @@ def test_mysql_id_table_can_represent_an_empty_constraint_set():
     assert params == []
 
 
+def test_mysql_destination_id_temp_table_uses_real_columns_and_an_index(monkeypatch):
+    queries = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            pass
+
+        def execute(self, query):
+            queries.append(query)
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    monkeypatch.setattr(mysql_database_helper.uuid, "uuid4", lambda: "fixed")
+    monkeypatch.setattr(
+        mysql_database_helper,
+        "fully_qualified_table",
+        lambda table: "`{}`".format(table),
+    )
+    monkeypatch.setattr(
+        mysql_database_helper, "quoter", lambda column: "`{}`".format(column)
+    )
+
+    table = mysql_database_helper.create_id_temp_table(
+        Connection(), 2, "destination.parents", ["code", "version"]
+    )
+
+    assert table == "tonic_subset_fixed"
+    assert queries == [
+        "CREATE TEMPORARY TABLE `tonic_subset_fixed` AS SELECT "
+        "IF(TRUE, `code`, NULL) AS `col0`,"
+        "IF(TRUE, `version`, NULL) AS `col1` "
+        "FROM `destination.parents` LIMIT 0",
+        "CREATE INDEX `tonic_subset_ids` ON `tonic_subset_fixed` (`col0`,`col1`)",
+    ]
+
+
 def test_mysql_membership_values_are_split_into_safe_batches():
     values = list(range(2001))
 

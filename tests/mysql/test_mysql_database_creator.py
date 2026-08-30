@@ -84,6 +84,73 @@ def test_create_dumps_complete_schema_and_imports_it(creator, monkeypatch):
     }
 
 
+def test_create_keeps_enabled_events_disabled_until_explicitly_enabled(
+    creator, monkeypatch
+):
+    calls = []
+    schema = (
+        b"/*!50106 CREATE*/ /*!50117 DEFINER=`root`@`%`*/ "
+        b"/*!50106 EVENT `enabled``event` ON SCHEDULE EVERY 1 DAY "
+        b"ON COMPLETION NOT PRESERVE ENABLE COMMENT 'ENABLE here' "
+        b"DO SELECT 'ENABLE in body' */ ;;\n"
+        b"/*!50106 CREATE*/ /*!50117 DEFINER=`root`@`%`*/ "
+        b"/*!50106 EVENT `disabled_event` ON SCHEDULE EVERY 1 DAY "
+        b"ON COMPLETION PRESERVE DISABLE DO SELECT 2 */ ;;\n"
+    )
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=schema if command[0].endswith("mysqldump") else None,
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(
+        mysql_database_creator, "get_mysql_bin_path", lambda: "/opt/mysql/bin"
+    )
+    monkeypatch.setattr(mysql_database_creator.subprocess, "run", run)
+
+    creator.create()
+
+    imported_schema = calls[2][1]["input"]
+    assert b"`enabled``event` ON SCHEDULE EVERY 1 DAY " in imported_schema
+    assert (
+        b"ON COMPLETION NOT PRESERVE DISABLE COMMENT 'ENABLE here'" in imported_schema
+    )
+    assert b"ON COMPLETION PRESERVE DISABLE DO SELECT 2" in imported_schema
+
+    creator.enable_events()
+
+    assert calls[3][0][-1] == ("--execute=ALTER EVENT `subset`.`enabled``event` ENABLE")
+
+
+def test_create_rejects_unrecognized_event_dump_before_import(creator, monkeypatch):
+    calls = []
+    schema = (
+        b"/*!50106 CREATE*/ /*!50117 DEFINER=`root`@`%`*/ "
+        b"/*!50106 EVENT `unsafe_event` IN AN UNKNOWN FORMAT ENABLE DO SELECT 1 */ ;;"
+    )
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=schema if command[0].endswith("mysqldump") else None,
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(mysql_database_creator, "get_mysql_bin_path", lambda: "")
+    monkeypatch.setattr(mysql_database_creator.subprocess, "run", run)
+
+    with pytest.raises(Exception, match="event definitions"):
+        creator.create()
+
+    assert len(calls) == 1
+
+
 def test_teardown_quotes_destination_database(creator, monkeypatch):
     commands = []
     creator.destination_dbc.db_name = "subset`quoted"

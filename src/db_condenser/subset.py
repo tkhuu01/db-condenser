@@ -1149,7 +1149,10 @@ class Subset:
         fqt = fully_qualified_table(target)
         batch_size = self.__db_helper.get_batch_size(len(fk_datatypes))
 
-        if self.config.db_type == DbType.MYSQL and len(relevant_key_constraints) > 1:
+        if self.config.db_type == DbType.MYSQL and (
+            len(relevant_key_constraints) > 1
+            or self.config.max_rows_per_table is not None
+        ):
             self.__subset_upstream_mysql_multi_fk(
                 target,
                 fqt,
@@ -1701,7 +1704,17 @@ class Subset:
         if skip:
             return
 
-        temp_table = self.__db_helper.create_id_temp_table(dest_conn, len(pk_columns))
+        if self.config.db_type == DbType.MYSQL:
+            temp_table = self.__db_helper.create_id_temp_table(
+                dest_conn,
+                len(pk_columns),
+                mysql_db_name_hack(table, dest_conn),
+                pk_columns,
+            )
+        else:
+            temp_table = self.__db_helper.create_id_temp_table(
+                dest_conn, len(pk_columns)
+            )
 
         for r in referencing_tables:
             fk_table = r["fk_table"]
