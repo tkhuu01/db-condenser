@@ -2757,7 +2757,7 @@ def multi_fk_batch_dbs():
     IDs, a streamed join that binds the same batch to both constraints drops
     every ring edge whose ends fall in different batches.
     """
-    import db_condenser.subset as subset_mod
+    from db_condenser.backends import downstream, execution, upstream
 
     source_db = SOURCE_DB + "_mfk"
     dest_db = DEST_DB + "_mfk"
@@ -2815,8 +2815,13 @@ def multi_fk_batch_dbs():
     config_reader.config = config_reader._raw_dict_to_config(raw_config)
     config = config_reader.get_config()
 
-    real_batch_size = subset_mod.compute_batch_size
-    subset_mod.compute_batch_size = lambda column_count: 2
+    # The same two-row stress batch now applies at the extracted SQL sites.
+    real_batch_sizes = {
+        module: module.compute_batch_size
+        for module in (downstream, execution, upstream)
+    }
+    for module in real_batch_sizes:
+        module.compute_batch_size = lambda column_count: 2
     try:
         source_dbc = DbConnect(config.db_type, config.source_db_connection_info)
         destination_dbc = DbConnect(
@@ -2835,7 +2840,8 @@ def multi_fk_batch_dbs():
             subsetter.unprep_temp_dbs()
             subsetter.close_connections()
     finally:
-        subset_mod.compute_batch_size = real_batch_size
+        for module, real_batch_size in real_batch_sizes.items():
+            module.compute_batch_size = real_batch_size
 
     dest = psycopg.connect(
         dbname=dest_db,
