@@ -15,6 +15,7 @@ from db_condenser.backends.upstream import (
     _upstream_ids_query,
 )
 from db_condenser.config_reader import DbType, InitialTarget
+from db_condenser.runner import _subset_run
 from db_condenser.subset import Subset
 
 
@@ -100,12 +101,8 @@ def test_traversal_orders_operations_without_sql(monkeypatch, parallel):
         events.append(("downstream", table))
     )
     subset = Subset(source, destination, tables, backend=backend)
-    subset.prep_temp_dbs()
-    try:
-        subset.run_middle_out()
-    finally:
-        subset.unprep_temp_dbs()
-        subset.close_connections()
+    with _subset_run(subset):
+        pass
     assert events == [
         ("pre_filters",),
         ("direct_parallel" if parallel else "direct", "app.root"),

@@ -17,6 +17,7 @@ from psycopg.types.json import Json
 
 from db_condenser import config_reader
 from db_condenser.db_connect import DbConnect
+from db_condenser.runner import _subset_run
 from db_condenser.subset import Subset
 
 DB_USER = os.environ.get("POSTGRES_USER", "test")
@@ -478,16 +479,8 @@ def _run_case(case, source_database, destination_database, mode="grow"):
     destination_dbc = DbConnect(config.db_type, config.destination_db_connection_info)
     all_tables = [table.qualified for table in case.tables]
     subsetter = Subset(source_dbc, destination_dbc, all_tables)
-    succeeded = False
-    try:
-        subsetter.prep_temp_dbs()
-        subsetter.run_middle_out()
-        succeeded = True
-    finally:
-        try:
-            subsetter.unprep_temp_dbs(succeeded=succeeded)
-        finally:
-            subsetter.close_connections()
+    with _subset_run(subsetter):
+        pass
 
 
 def _actual_keys(conn, table):

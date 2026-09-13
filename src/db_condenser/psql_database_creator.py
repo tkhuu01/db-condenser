@@ -1,5 +1,6 @@
 import os
 import subprocess
+from contextlib import closing
 from urllib.parse import urlencode
 
 from db_condenser import database_helper
@@ -21,7 +22,6 @@ class PsqlDatabaseCreator:
     def __init__(self, source_dbc, destination_dbc, use_existing_dump=False):
         self.destination_dbc = destination_dbc
         self.source_dbc = source_dbc
-        self.__source_db_connection = source_dbc.get_db_connection()
 
         self.use_existing_dump = use_existing_dump
 
@@ -58,7 +58,8 @@ class PsqlDatabaseCreator:
 
     def teardown(self):
         helper = database_helper.get_specific_helper()
-        user_schemas = helper.list_all_user_schemas(self.__source_db_connection)
+        with closing(self.source_dbc.get_db_connection()) as connection:
+            user_schemas = helper.list_all_user_schemas(connection)
 
         if len(user_schemas) == 0:
             raise Exception("Couldn't find any non system schemas.")

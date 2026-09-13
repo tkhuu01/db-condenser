@@ -78,7 +78,7 @@ class Subset:
     def __get_source_connection(self):
         return self.__session.open_source_connection()
 
-    def run_middle_out(self):
+    def _run_middle_out(self):
         passthrough_tables = self.config.passthrough_tables
         relationships = self.__backend.get_unredacted_fk_relationships(
             self.__all_tables, self.__source_conn
@@ -188,7 +188,7 @@ class Subset:
                 )
             )
 
-    def prep_temp_dbs(self):
+    def _prepare(self):
         self.__session.prepare()
         if self.__incremental:
             relationships = self.__backend.get_unredacted_fk_relationships(
@@ -207,10 +207,10 @@ class Subset:
                 ]
             self.__session.prepare_incremental(incremental_tables)
 
-    def unprep_temp_dbs(self, succeeded=True):
+    def _finalize(self, succeeded: bool):
         self.__session.finish(succeeded)
 
-    def close_connections(self):
+    def _close(self):
         self.__session.close()
 
     def __process_stratum_upstream(

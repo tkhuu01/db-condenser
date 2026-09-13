@@ -12,6 +12,7 @@ from db_condenser.backends.contracts import Backend, SchemaManager
 from db_condenser.backends.execution import SqlSelectionExecutor
 from db_condenser.backends.mysql import MySqlRunSession
 from db_condenser.config_reader import DbType
+from db_condenser.runner import _subset_run
 from db_condenser.subset import Subset
 
 
@@ -144,19 +145,14 @@ def test_real_traversal_accepts_a_recording_backend(monkeypatch, fail_copy):
     failure = RuntimeError("transfer interrupted")
     if fail_copy:
         backend.copy_rows.side_effect = failure
-    succeeded = False
-    try:
-        subset.prep_temp_dbs()
-        if fail_copy:
-            with pytest.raises(RuntimeError) as exc:
-                subset.run_middle_out()
-            assert exc.value is failure
-        else:
-            subset.run_middle_out()
-            succeeded = True
-    finally:
-        subset.unprep_temp_dbs(succeeded)
-        subset.close_connections()
+    if fail_copy:
+        with pytest.raises(RuntimeError) as exc:
+            with _subset_run(subset):
+                pass
+        assert exc.value is failure
+    else:
+        with _subset_run(subset):
+            pass
     backend.turn_off_constraints.assert_called_once_with(destination_conn)
     backend.prep_temp_dbs.assert_called_once_with(source_conn, destination_conn)
     backend.unprep_temp_dbs.assert_called_once_with(source_conn, destination_conn)

@@ -1,15 +1,13 @@
 import json
 import os
+import time
 from pathlib import Path
 
 import psycopg
 import pytest
 from psycopg.types.json import Json
 
-from db_condenser import config_reader, database_helper, result_tabulator
-from db_condenser.db_connect import DbConnect, PsqlConnection
-from db_condenser.direct_subset import db_creator
-from db_condenser.subset import Subset
+from db_condenser import config_reader, psql_database_helper, run_subset
 
 TEST_DIR = Path(__file__).parent
 SEED_SQL = TEST_DIR / "seed.sql"
@@ -22,6 +20,42 @@ DB_PORT = os.environ.get("POSTGRES_PORT", "5432")
 
 SOURCE_DB = "condenser_test_source"
 DEST_DB = "condenser_test_dest"
+
+
+@pytest.mark.parametrize("mode", ["recreate", "topup", "grow"])
+def test_runner_releases_connections_and_restores_config(mode):
+    param = dict(
+        use_temp_tables=False,
+        suffix_override="_runner_" + mode,
+        parallel_read_workers=4,
+        config_overrides={
+            "pre_constraint_sql": ["SELECT 1"],
+            "post_subset_sql": ["SELECT 1"],
+        },
+        report=True,
+    )
+    previous = config_reader.config
+    source_db = SOURCE_DB + param["suffix_override"]
+    dest_db = DEST_DB + param["suffix_override"]
+    try:
+        _run_subsetter(**param)
+        if mode != "recreate":
+            _run_subsetter(**param, mode=mode)
+        assert config_reader.config is previous
+        # Driver close sends termination; allow the server to process it.
+        with _admin_conn() as admin:
+            deadline = time.monotonic() + 2
+            while True:
+                count = admin.execute(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname IN (%s,%s)",
+                    (source_db, dest_db),
+                ).fetchone()[0]
+                if count == 0 or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            assert count == 0
+    finally:
+        _drop_test_databases(source_db, dest_db)
 
 
 def _admin_conn(dbname="postgres"):
@@ -62,6 +96,7 @@ def _run_subsetter(
     config_overrides: dict | None = None,
     setup_sql: list[str] | None = None,
     reset_databases: bool = True,
+    report: bool = False,
 ) -> tuple[str, str]:
     if suffix_override is not None:
         suffix = suffix_override
@@ -97,48 +132,7 @@ def _run_subsetter(
     if config_overrides:
         raw_config.update(config_overrides)
 
-    config_reader.reset_config()
-    config_reader.config = config_reader._raw_dict_to_config(raw_config)
-
-    config = config_reader.get_config()
-    db_type = config.db_type
-    source_dbc = DbConnect(db_type, config.source_db_connection_info)
-    destination_dbc = DbConnect(db_type, config.destination_db_connection_info)
-
-    database = db_creator(db_type, source_dbc, destination_dbc)
-    if fresh:
-        database.teardown()
-        database.create()
-
-    db_helper = database_helper.get_specific_helper()
-    all_tables = db_helper.list_all_tables(source_dbc)
-    all_tables = [x for x in all_tables if x not in config.excluded_tables]
-
-    subsetter = Subset(source_dbc, destination_dbc, all_tables)
-    succeeded = False
-    try:
-        subsetter.prep_temp_dbs()
-        subsetter.run_middle_out()
-
-        for sql_stmt in config.pre_constraint_sql:
-            db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
-
-        if fresh:
-            database.add_constraints()
-
-        for sql_stmt in config.post_subset_sql:
-            db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
-
-        all_tables_no_pg = [t for t in all_tables if "pgbench" not in t]
-        dest_conn = destination_dbc.get_db_connection()
-        assert isinstance(dest_conn, PsqlConnection)
-        db_helper.update_sequence_numbering(dest_conn, all_tables_no_pg)
-        succeeded = True
-    finally:
-        try:
-            subsetter.unprep_temp_dbs(succeeded=succeeded)
-        finally:
-            subsetter.close_connections()
+    run_subset(config_reader._raw_dict_to_config(raw_config), report=report)
 
     return source_db, dest_db
 
@@ -763,29 +757,7 @@ def pre_filter_dbs():
     ]
     raw_config["parallel_read_workers"] = 4
 
-    config_reader.reset_config()
-    config_reader.config = config_reader._raw_dict_to_config(raw_config)
-
-    config = config_reader.get_config()
-    db_type = config.db_type
-    source_dbc = DbConnect(db_type, config.source_db_connection_info)
-    destination_dbc = DbConnect(db_type, config.destination_db_connection_info)
-
-    database = db_creator(db_type, source_dbc, destination_dbc)
-    database.teardown()
-    database.create()
-
-    db_helper = database_helper.get_specific_helper()
-    all_tables = db_helper.list_all_tables(source_dbc)
-    all_tables = [x for x in all_tables if x not in config.excluded_tables]
-
-    subsetter = Subset(source_dbc, destination_dbc, all_tables)
-    try:
-        subsetter.prep_temp_dbs()
-        subsetter.run_middle_out()
-    finally:
-        subsetter.unprep_temp_dbs()
-        subsetter.close_connections()
+    run_subset(config_reader._raw_dict_to_config(raw_config), report=False)
 
     dest = psycopg.connect(
         dbname=dest_db,
@@ -1073,17 +1045,7 @@ def test_incremental_report_handles_new_disconnected_source_table(capsys):
         source.commit()
         source.close()
 
-        _run_subsetter(**param, mode="topup")
-
-        config = config_reader.get_config()
-        source_dbc = DbConnect(config.db_type, config.source_db_connection_info)
-        destination_dbc = DbConnect(
-            config.db_type, config.destination_db_connection_info
-        )
-        db_helper = database_helper.get_specific_helper()
-        all_tables = db_helper.list_all_tables(source_dbc)
-
-        result_tabulator.tabulate(source_dbc, destination_dbc, all_tables)
+        _run_subsetter(**param, mode="topup", report=True)
 
         assert "public.later_unconfigured" in capsys.readouterr().out
         dest = psycopg.connect(
@@ -1179,7 +1141,7 @@ def test_incremental_config_hash_canonicalizes_unordered_lists():
             "public.regions",
             "public.feature_flags",
         ]
-        helper = database_helper.get_specific_helper()
+        helper = psql_database_helper
         identity_map = {"sales.customers": ["id"]}
         first_hash = helper._incremental_config_hash(identity_map)
 
@@ -1617,7 +1579,7 @@ def test_failed_topup_resumes_retained_journal(monkeypatch):
         source.commit()
         source.close()
 
-        helper = database_helper.get_specific_helper()
+        helper = psql_database_helper
         real_update_sequences = helper.update_sequence_numbering
 
         def fail_after_transfer(*args, **kwargs):
@@ -1679,7 +1641,7 @@ def test_recreate_clears_retained_incremental_journal(monkeypatch):
     dest_db = DEST_DB + "_recreate_journal"
     try:
         source_db, dest_db = _run_subsetter(**param)
-        helper = database_helper.get_specific_helper()
+        helper = psql_database_helper
         real_update_sequences = helper.update_sequence_numbering
 
         def fail_after_transfer(*args, **kwargs):
@@ -1713,7 +1675,7 @@ def test_fk_restore_failure_retains_journal(monkeypatch):
     dest_db = DEST_DB + "_resume_fk"
     try:
         source_db, dest_db = _run_subsetter(**param)
-        helper = database_helper.get_specific_helper()
+        helper = psql_database_helper
         real_restore = helper.restore_fk_constraints
 
         def fail_restore(*args, **kwargs):
@@ -2591,7 +2553,7 @@ def test_failed_history_grow_rejects_partial_config_edits(monkeypatch):
         source_db, dest_db = _run_subsetter(**param)
         _apply_audit_history_mutations(source_db)
 
-        helper = database_helper.get_specific_helper()
+        helper = psql_database_helper
         real_update_sequences = helper.update_sequence_numbering
 
         def fail_after_transfer(*args, **kwargs):
@@ -2823,22 +2785,7 @@ def multi_fk_batch_dbs():
     for module in real_batch_sizes:
         module.compute_batch_size = lambda column_count: 2
     try:
-        source_dbc = DbConnect(config.db_type, config.source_db_connection_info)
-        destination_dbc = DbConnect(
-            config.db_type, config.destination_db_connection_info
-        )
-        database = db_creator(config.db_type, source_dbc, destination_dbc)
-        database.teardown()
-        database.create()
-        db_helper = database_helper.get_specific_helper()
-        all_tables = db_helper.list_all_tables(source_dbc)
-        subsetter = Subset(source_dbc, destination_dbc, all_tables)
-        try:
-            subsetter.prep_temp_dbs()
-            subsetter.run_middle_out()
-        finally:
-            subsetter.unprep_temp_dbs()
-            subsetter.close_connections()
+        run_subset(config, report=False)
     finally:
         for module, real_batch_size in real_batch_sizes.items():
             module.compute_batch_size = real_batch_size

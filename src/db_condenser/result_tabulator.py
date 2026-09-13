@@ -1,3 +1,5 @@
+from contextlib import ExitStack, closing
+
 from db_condenser import database_helper
 from db_condenser.backends.contracts import Backend
 from db_condenser.db_connect import MySqlConnection
@@ -12,12 +14,14 @@ def tabulate(
     backend: Backend | None = None,
 ):
     row_counts = list()
-    source_conn = source_dbc.get_db_connection()
-    dest_conn = destination_dbc.get_db_connection()
     db_helper = (
         backend if backend is not None else database_helper.get_specific_helper()
     )
-    try:
+    with ExitStack() as connections:
+        source_conn = connections.enter_context(closing(source_dbc.get_db_connection()))
+        dest_conn = connections.enter_context(
+            closing(destination_dbc.get_db_connection())
+        )
         for table in tables:
             o = db_helper.get_table_count_estimate(
                 table_name(table), schema_name(table), source_conn
@@ -31,9 +35,6 @@ def tabulate(
                 table_name(table), dest_schema_name, dest_conn
             )
             row_counts.append((table, max(int(o), 0), max(int(n), 0)))
-    finally:
-        source_conn.close()
-        dest_conn.close()
 
     name_w = max(len("Table") + 1, max((len(x[0]) for x in row_counts), default=0) + 1)
     src_w = max(
