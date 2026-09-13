@@ -274,18 +274,18 @@ def get_table_columns(table, schema, conn):
 
 def list_all_tables(db_connect):
     conn = db_connect.get_db_connection()
-    cur = conn.cursor()
     try:
-        cur.execute(
-            """
-            SELECT concat(concat(table_schema,'.'),table_name)
-              FROM information_schema.tables
-             WHERE table_schema = '{}' AND table_type = 'BASE TABLE';
-             """.format(db_connect.db_name)
-        )
-        return [r[0] for r in cur.fetchall()]
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT concat(concat(table_schema,'.'),table_name)
+                  FROM information_schema.tables
+                 WHERE table_schema = '{}' AND table_type = 'BASE TABLE';
+                 """.format(db_connect.db_name)
+            )
+            return [r[0] for r in cur.fetchall()]
     finally:
-        cur.close()
+        conn.close()
 
 
 def truncate_table(target_table, conn):

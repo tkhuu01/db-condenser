@@ -1,4 +1,4 @@
-"""Explicit, thin delegation while SQL and run-state extraction are pending."""
+"""Explicit reuse of existing helpers and SQL selection by shipped adapters."""
 
 from types import ModuleType
 
@@ -8,12 +8,25 @@ from db_condenser.backends.contracts import (
     ConnectionFactory,
     QueryParameters,
     Relationship,
+    RunSession,
+    SelectionExecutor,
 )
+from db_condenser.config_reader import Config, DbType
 
 
 class LegacyOperations:
     def __init__(self, helper: ModuleType):
         self._helper = helper
+
+    def uses_incremental(self, config: Config) -> bool:
+        return config.is_incremental and config.db_type == DbType.POSTGRES
+
+    def selection_executor(
+        self, session: RunSession, destination: ConnectionFactory, config: Config
+    ) -> SelectionExecutor:
+        from db_condenser.backends.execution import SqlSelectionExecutor
+
+        return SqlSelectionExecutor(self, self._helper, session, destination, config)
 
     def list_all_tables(self, source: ConnectionFactory) -> list[str]:
         return self._helper.list_all_tables(source)

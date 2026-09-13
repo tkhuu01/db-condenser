@@ -8,6 +8,7 @@ import pytest
 
 from db_condenser import config_reader, mysql_database_helper
 from db_condenser.db_connect import DbConnect
+from db_condenser.runner import _subset_run
 from db_condenser.subset import Subset
 
 
@@ -84,13 +85,5 @@ def run_case(config, *, relationships=False):
     if relationships:
         tables.append(source.db_name + ".child")
     subset = Subset(source, destination, tables)
-    succeeded = False
-    try:
-        subset.prep_temp_dbs()
-        subset.run_middle_out()
-        succeeded = True
-    finally:
-        try:
-            subset.unprep_temp_dbs(succeeded)
-        finally:
-            subset.close_connections()
+    with _subset_run(subset):
+        pass

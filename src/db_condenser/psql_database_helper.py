@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import uuid
+from contextlib import closing
 from dataclasses import asdict
 
 from psycopg import sql
@@ -1254,8 +1255,7 @@ def list_all_user_schemas(conn):
 
 
 def list_all_tables(db_connect):
-    conn = db_connect.get_db_connection()
-    with conn.cursor() as cur:
+    with closing(db_connect.get_db_connection()) as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT concat(concat(nsp.nspname,'.'),cls.relname)
               FROM pg_class cls
