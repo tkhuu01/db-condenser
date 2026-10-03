@@ -1666,6 +1666,178 @@ def test_recreate_clears_retained_incremental_journal(monkeypatch):
         _drop_test_databases(source_db, dest_db)
 
 
+@pytest.mark.parametrize("mode", ["topup", "grow"])
+@pytest.mark.parametrize("use_temp_tables", [False, True])
+@pytest.mark.parametrize("keep_disconnected", [False, True])
+@pytest.mark.parametrize("fail_restore", [False, True])
+def test_incremental_drops_only_participating_fks(
+    monkeypatch, mode, use_temp_tables, keep_disconnected, fail_restore
+):
+    suffix = f"_fk_scope_{mode}_{int(use_temp_tables)}_{int(keep_disconnected)}_{int(fail_restore)}"
+    param = {
+        "use_temp_tables": use_temp_tables,
+        "suffix_override": suffix,
+        "setup_sql": [
+            "CREATE TABLE public.scope_parent (id INT PRIMARY KEY)",
+            "CREATE TABLE public.scope_child (id INT PRIMARY KEY,"
+            " parent_id INT REFERENCES public.scope_parent(id))",
+            "CREATE TABLE sales.scope_excluded (id INT PRIMARY KEY,"
+            " customer_id INT REFERENCES sales.customers(id))",
+        ],
+        "config_overrides": {
+            "keep_disconnected_tables": keep_disconnected,
+            "excluded_tables": ["sales.scope_excluded"],
+        },
+    }
+    source_db = SOURCE_DB + suffix
+    dest_db = DEST_DB + suffix
+
+    def constraints():
+        with _admin_conn(dest_db) as dest:
+            return dict(
+                dest.execute(
+                    "SELECT ns.nspname || '.' || cl.relname, con.oid"
+                    " FROM pg_constraint con"
+                    " JOIN pg_class cl ON cl.oid = con.conrelid"
+                    " JOIN pg_namespace ns ON ns.oid = cl.relnamespace"
+                    " WHERE con.contype = 'f' AND con.conname IN ("
+                    " 'scope_child_parent_id_fkey', 'scope_excluded_customer_id_fkey',"
+                    " 'scope_destination_only_customer_id_fkey', 'orders_customer_id_fkey')"
+                ).fetchall()
+            )
+
+    outside = {"sales.scope_excluded", "public.scope_destination_only"}
+    if not keep_disconnected:
+        outside.add("public.scope_child")
+    try:
+        _run_subsetter(**param)
+        with _admin_conn(dest_db) as dest:
+            dest.execute(
+                "CREATE TABLE public.scope_destination_only (id INT PRIMARY KEY,"
+                " customer_id INT REFERENCES sales.customers(id))"
+            )
+        before = constraints()
+        real_drop = psql_database_helper.drop_fk_constraints
+        real_restore = psql_database_helper.restore_fk_constraints
+        observed = []
+
+        def check_drop(*args):
+            definitions = real_drop(*args)
+            during = constraints()
+            assert {t: during.get(t) for t in outside} == {
+                t: before[t] for t in outside
+            }
+            assert "sales.orders" not in during
+            if keep_disconnected:
+                assert "public.scope_child" not in during
+            assert not outside.intersection(f"{s}.{t}" for s, t, _, _ in definitions)
+            observed.append(True)
+            return definitions
+
+        def restore_failure(*args):
+            raise RuntimeError("scoped restore failure")
+
+        monkeypatch.setattr(psql_database_helper, "drop_fk_constraints", check_drop)
+        if fail_restore:
+            monkeypatch.setattr(
+                psql_database_helper, "restore_fk_constraints", restore_failure
+            )
+            with pytest.raises(RuntimeError, match="scoped restore failure"):
+                _run_subsetter(**param, mode=mode)
+            after_failure = constraints()
+            assert {t: after_failure.get(t) for t in outside} == {
+                t: before[t] for t in outside
+            }
+            with _admin_conn(dest_db) as dest:
+                assert _query_one(
+                    dest, "SELECT to_regnamespace('_condenser') IS NOT NULL"
+                )
+            monkeypatch.setattr(
+                psql_database_helper, "restore_fk_constraints", real_restore
+            )
+        _run_subsetter(**param, mode=mode)
+        after = constraints()
+        assert observed
+        assert {t: after[t] for t in outside} == {t: before[t] for t in outside}
+        assert "sales.orders" in after
+        assert "public.scope_child" in after
+        with _admin_conn(dest_db) as dest:
+            assert _query_one(dest, "SELECT to_regnamespace('_condenser') IS NULL")
+            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+                dest.execute("INSERT INTO sales.scope_excluded VALUES (1, 999)")
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
+def test_scoped_fk_drop_recovers_legacy_unrelated_backups(monkeypatch):
+    param = {
+        "use_temp_tables": False,
+        "suffix_override": "_legacy_fk_scope",
+        "setup_sql": [
+            "CREATE TABLE public.legacy_parent (id INT PRIMARY KEY)",
+            "CREATE TABLE public.legacy_missing (id INT PRIMARY KEY,"
+            " parent_id INT REFERENCES public.legacy_parent(id))",
+            "CREATE TABLE public.legacy_live (id INT PRIMARY KEY,"
+            " parent_id INT REFERENCES public.legacy_parent(id))",
+        ],
+        "config_overrides": {"keep_disconnected_tables": False},
+    }
+    source_db = SOURCE_DB + param["suffix_override"]
+    dest_db = DEST_DB + param["suffix_override"]
+    try:
+        _run_subsetter(**param)
+        real_restore = psql_database_helper.restore_fk_constraints
+
+        def fail_restore(*args):
+            raise RuntimeError("legacy restore failure")
+
+        monkeypatch.setattr(
+            psql_database_helper, "restore_fk_constraints", fail_restore
+        )
+        with pytest.raises(RuntimeError, match="legacy restore failure"):
+            _run_subsetter(**param, mode="grow")
+        monkeypatch.setattr(
+            psql_database_helper, "restore_fk_constraints", real_restore
+        )
+        with _admin_conn(dest_db) as dest:
+            dest.execute(
+                "INSERT INTO _condenser.fk_backup"
+                " SELECT ns.nspname, cl.relname, con.conname, pg_get_constraintdef(con.oid)"
+                " FROM pg_constraint con"
+                " JOIN pg_class cl ON cl.oid = con.conrelid"
+                " JOIN pg_namespace ns ON ns.oid = cl.relnamespace"
+                " WHERE con.contype = 'f' AND ns.nspname = 'public'"
+                " AND cl.relname IN ('legacy_missing', 'legacy_live')"
+                " ON CONFLICT DO NOTHING"
+            )
+            live_oid = _query_one(
+                dest,
+                "SELECT oid FROM pg_constraint WHERE conname = 'legacy_live_parent_id_fkey'",
+            )
+            dest.execute(
+                "ALTER TABLE public.legacy_missing DROP CONSTRAINT legacy_missing_parent_id_fkey"
+            )
+        _run_subsetter(**param, mode="grow")
+        with _admin_conn(dest_db) as dest:
+            assert (
+                _query_one(
+                    dest,
+                    "SELECT oid FROM pg_constraint WHERE conname = 'legacy_live_parent_id_fkey'",
+                )
+                == live_oid
+            )
+            assert (
+                _query_one(
+                    dest,
+                    "SELECT count(*) FROM pg_constraint WHERE conname = 'legacy_missing_parent_id_fkey'",
+                )
+                == 1
+            )
+            assert _query_one(dest, "SELECT to_regnamespace('_condenser') IS NULL")
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
 def test_fk_restore_failure_retains_journal(monkeypatch):
     param = {
         "use_temp_tables": False,

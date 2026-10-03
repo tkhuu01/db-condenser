@@ -77,7 +77,9 @@ class PostgresRunSession(BaseRunSession):
     def prepare_incremental(self, tables):
         psql_database_helper.prep_incremental(self.source, self.destination, tables)
         self._incremental_prepared = True
-        self._dropped_fks = psql_database_helper.drop_fk_constraints(self.destination)
+        self._dropped_fks = psql_database_helper.drop_fk_constraints(
+            self.destination, tables
+        )
 
     def finish(self, succeeded):
         super().finish(succeeded)
