@@ -9,8 +9,10 @@ import pytest
 from db_condenser import config_reader, database_helper
 from db_condenser.backends import get_backend
 from db_condenser.backends.contracts import Backend, SchemaManager
+from db_condenser.backends.execution import SqlSelectionExecutor
 from db_condenser.backends.mysql import MySqlRunSession
 from db_condenser.config_reader import DbType
+from db_condenser.runner import _subset_run
 from db_condenser.subset import Subset
 
 
@@ -127,6 +129,10 @@ def test_real_traversal_accepts_a_recording_backend(monkeypatch, fail_copy):
     )
     monkeypatch.setattr(config_reader, "config", config)
     backend = create_autospec(Backend, instance=True, spec_set=True)
+    backend.uses_incremental.return_value = False
+    backend.selection_executor.side_effect = lambda session, destination, config: (
+        SqlSelectionExecutor(backend, Mock(), session, destination, config)
+    )
     backend.open_run.side_effect = lambda source, destination, config: MySqlRunSession(
         backend, source, destination, config
     )
@@ -139,19 +145,14 @@ def test_real_traversal_accepts_a_recording_backend(monkeypatch, fail_copy):
     failure = RuntimeError("transfer interrupted")
     if fail_copy:
         backend.copy_rows.side_effect = failure
-    succeeded = False
-    try:
-        subset.prep_temp_dbs()
-        if fail_copy:
-            with pytest.raises(RuntimeError) as exc:
-                subset.run_middle_out()
-            assert exc.value is failure
-        else:
-            subset.run_middle_out()
-            succeeded = True
-    finally:
-        subset.unprep_temp_dbs(succeeded)
-        subset.close_connections()
+    if fail_copy:
+        with pytest.raises(RuntimeError) as exc:
+            with _subset_run(subset):
+                pass
+        assert exc.value is failure
+    else:
+        with _subset_run(subset):
+            pass
     backend.turn_off_constraints.assert_called_once_with(destination_conn)
     backend.prep_temp_dbs.assert_called_once_with(source_conn, destination_conn)
     backend.unprep_temp_dbs.assert_called_once_with(source_conn, destination_conn)

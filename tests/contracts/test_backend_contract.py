@@ -6,7 +6,7 @@ their existing integration suites; this is not a claim of feature parity.
 
 import pytest
 
-from db_condenser.config_reader import DbType, get_config
+from db_condenser.config_reader import DbType, InitialTarget, get_config
 from db_condenser.db_connect import DbConnect
 
 pytestmark = pytest.mark.integration
@@ -96,6 +96,30 @@ def test_hook_respects_commit_flag(backend_case):
         "INSERT INTO child VALUES (50,1,'alpha','committed')", case.destination
     )
     assert rows(case.observe_destination()) == [(50, 1, "alpha", "committed")]
+
+
+def test_selection_executor_filters_at_source(backend_case):
+    case = backend_case
+    config = get_config()
+    source = DbConnect(config.db_type, config.source_db_connection_info)
+    destination = DbConnect(config.db_type, config.destination_db_connection_info)
+    session = case.backend.open_run(source, destination, config)
+    try:
+        executor = case.backend.selection_executor(session, destination, config)
+        executor.load_pre_filters()
+        executor.select_direct(
+            InitialTarget(
+                table=case.source_schema + ".child", where="parent_tenant = 1"
+            ),
+            [],
+        )
+        assert rows(case.observe_destination()) == [(10, 1, "alpha", "accepted")]
+        assert rows(session.source) == [
+            (10, 1, "alpha", "accepted"),
+            (20, 2, "beta", "rejected"),
+        ]
+    finally:
+        session.close()
 
 
 def test_postgres_run_readers_keep_snapshot_after_committed_source_write(backend_case):

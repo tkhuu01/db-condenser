@@ -93,7 +93,10 @@ def backend_case(request, monkeypatch):
             source_schema="public" if postgres else names[0],
             destination_schema="public" if postgres else names[1],
             source_factory=SimpleNamespace(
-                db_name=names[0], get_db_connection=lambda: source
+                db_name=names[0],
+                get_db_connection=lambda: DbConnect(
+                    db_type, config.source_db_connection_info
+                ).get_db_connection(),
             ),
             observe_destination=lambda: connect(config.destination_db_connection_info),
         )

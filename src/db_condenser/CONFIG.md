@@ -198,6 +198,12 @@ OVERLAPS` constraints rather than loading them with unsafe semantics. Use
 `fk_augmentation` to describe history ownership that is logical but not backed
 by a physical foreign key.
 
+Incremental runs temporarily drop only FKs owned by tables participating in the
+run. FKs on excluded tables, disconnected tables skipped by
+`keep_disconnected_tables: false`, and destination-only tables remain enforced,
+including when they reference a participating parent. Previously backed-up FKs
+from failed runs are still restored, including those captured by older versions.
+
 The destination is protected by an advisory lock. A failed run retains its
 `_condenser` delta journal and FK definitions, and the same effective
 configuration resumes it on the next run. A different configuration or

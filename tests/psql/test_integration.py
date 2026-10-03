@@ -1,15 +1,13 @@
 import json
 import os
+import time
 from pathlib import Path
 
 import psycopg
 import pytest
 from psycopg.types.json import Json
 
-from db_condenser import config_reader, database_helper, result_tabulator
-from db_condenser.db_connect import DbConnect, PsqlConnection
-from db_condenser.direct_subset import db_creator
-from db_condenser.subset import Subset
+from db_condenser import config_reader, psql_database_helper, run_subset
 
 TEST_DIR = Path(__file__).parent
 SEED_SQL = TEST_DIR / "seed.sql"
@@ -22,6 +20,42 @@ DB_PORT = os.environ.get("POSTGRES_PORT", "5432")
 
 SOURCE_DB = "condenser_test_source"
 DEST_DB = "condenser_test_dest"
+
+
+@pytest.mark.parametrize("mode", ["recreate", "topup", "grow"])
+def test_runner_releases_connections_and_restores_config(mode):
+    param = dict(
+        use_temp_tables=False,
+        suffix_override="_runner_" + mode,
+        parallel_read_workers=4,
+        config_overrides={
+            "pre_constraint_sql": ["SELECT 1"],
+            "post_subset_sql": ["SELECT 1"],
+        },
+        report=True,
+    )
+    previous = config_reader.config
+    source_db = SOURCE_DB + param["suffix_override"]
+    dest_db = DEST_DB + param["suffix_override"]
+    try:
+        _run_subsetter(**param)
+        if mode != "recreate":
+            _run_subsetter(**param, mode=mode)
+        assert config_reader.config is previous
+        # Driver close sends termination; allow the server to process it.
+        with _admin_conn() as admin:
+            deadline = time.monotonic() + 2
+            while True:
+                count = admin.execute(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname IN (%s,%s)",
+                    (source_db, dest_db),
+                ).fetchone()[0]
+                if count == 0 or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            assert count == 0
+    finally:
+        _drop_test_databases(source_db, dest_db)
 
 
 def _admin_conn(dbname="postgres"):
@@ -62,6 +96,7 @@ def _run_subsetter(
     config_overrides: dict | None = None,
     setup_sql: list[str] | None = None,
     reset_databases: bool = True,
+    report: bool = False,
 ) -> tuple[str, str]:
     if suffix_override is not None:
         suffix = suffix_override
@@ -97,48 +132,7 @@ def _run_subsetter(
     if config_overrides:
         raw_config.update(config_overrides)
 
-    config_reader.reset_config()
-    config_reader.config = config_reader._raw_dict_to_config(raw_config)
-
-    config = config_reader.get_config()
-    db_type = config.db_type
-    source_dbc = DbConnect(db_type, config.source_db_connection_info)
-    destination_dbc = DbConnect(db_type, config.destination_db_connection_info)
-
-    database = db_creator(db_type, source_dbc, destination_dbc)
-    if fresh:
-        database.teardown()
-        database.create()
-
-    db_helper = database_helper.get_specific_helper()
-    all_tables = db_helper.list_all_tables(source_dbc)
-    all_tables = [x for x in all_tables if x not in config.excluded_tables]
-
-    subsetter = Subset(source_dbc, destination_dbc, all_tables)
-    succeeded = False
-    try:
-        subsetter.prep_temp_dbs()
-        subsetter.run_middle_out()
-
-        for sql_stmt in config.pre_constraint_sql:
-            db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
-
-        if fresh:
-            database.add_constraints()
-
-        for sql_stmt in config.post_subset_sql:
-            db_helper.run_query(sql_stmt, destination_dbc.get_db_connection())
-
-        all_tables_no_pg = [t for t in all_tables if "pgbench" not in t]
-        dest_conn = destination_dbc.get_db_connection()
-        assert isinstance(dest_conn, PsqlConnection)
-        db_helper.update_sequence_numbering(dest_conn, all_tables_no_pg)
-        succeeded = True
-    finally:
-        try:
-            subsetter.unprep_temp_dbs(succeeded=succeeded)
-        finally:
-            subsetter.close_connections()
+    run_subset(config_reader._raw_dict_to_config(raw_config), report=report)
 
     return source_db, dest_db
 
@@ -763,29 +757,7 @@ def pre_filter_dbs():
     ]
     raw_config["parallel_read_workers"] = 4
 
-    config_reader.reset_config()
-    config_reader.config = config_reader._raw_dict_to_config(raw_config)
-
-    config = config_reader.get_config()
-    db_type = config.db_type
-    source_dbc = DbConnect(db_type, config.source_db_connection_info)
-    destination_dbc = DbConnect(db_type, config.destination_db_connection_info)
-
-    database = db_creator(db_type, source_dbc, destination_dbc)
-    database.teardown()
-    database.create()
-
-    db_helper = database_helper.get_specific_helper()
-    all_tables = db_helper.list_all_tables(source_dbc)
-    all_tables = [x for x in all_tables if x not in config.excluded_tables]
-
-    subsetter = Subset(source_dbc, destination_dbc, all_tables)
-    try:
-        subsetter.prep_temp_dbs()
-        subsetter.run_middle_out()
-    finally:
-        subsetter.unprep_temp_dbs()
-        subsetter.close_connections()
+    run_subset(config_reader._raw_dict_to_config(raw_config), report=False)
 
     dest = psycopg.connect(
         dbname=dest_db,
@@ -1073,17 +1045,7 @@ def test_incremental_report_handles_new_disconnected_source_table(capsys):
         source.commit()
         source.close()
 
-        _run_subsetter(**param, mode="topup")
-
-        config = config_reader.get_config()
-        source_dbc = DbConnect(config.db_type, config.source_db_connection_info)
-        destination_dbc = DbConnect(
-            config.db_type, config.destination_db_connection_info
-        )
-        db_helper = database_helper.get_specific_helper()
-        all_tables = db_helper.list_all_tables(source_dbc)
-
-        result_tabulator.tabulate(source_dbc, destination_dbc, all_tables)
+        _run_subsetter(**param, mode="topup", report=True)
 
         assert "public.later_unconfigured" in capsys.readouterr().out
         dest = psycopg.connect(
@@ -1179,7 +1141,7 @@ def test_incremental_config_hash_canonicalizes_unordered_lists():
             "public.regions",
             "public.feature_flags",
         ]
-        helper = database_helper.get_specific_helper()
+        helper = psql_database_helper
         identity_map = {"sales.customers": ["id"]}
         first_hash = helper._incremental_config_hash(identity_map)
 
@@ -1617,7 +1579,7 @@ def test_failed_topup_resumes_retained_journal(monkeypatch):
         source.commit()
         source.close()
 
-        helper = database_helper.get_specific_helper()
+        helper = psql_database_helper
         real_update_sequences = helper.update_sequence_numbering
 
         def fail_after_transfer(*args, **kwargs):
@@ -1679,7 +1641,7 @@ def test_recreate_clears_retained_incremental_journal(monkeypatch):
     dest_db = DEST_DB + "_recreate_journal"
     try:
         source_db, dest_db = _run_subsetter(**param)
-        helper = database_helper.get_specific_helper()
+        helper = psql_database_helper
         real_update_sequences = helper.update_sequence_numbering
 
         def fail_after_transfer(*args, **kwargs):
@@ -1704,6 +1666,178 @@ def test_recreate_clears_retained_incremental_journal(monkeypatch):
         _drop_test_databases(source_db, dest_db)
 
 
+@pytest.mark.parametrize("mode", ["topup", "grow"])
+@pytest.mark.parametrize("use_temp_tables", [False, True])
+@pytest.mark.parametrize("keep_disconnected", [False, True])
+@pytest.mark.parametrize("fail_restore", [False, True])
+def test_incremental_drops_only_participating_fks(
+    monkeypatch, mode, use_temp_tables, keep_disconnected, fail_restore
+):
+    suffix = f"_fk_scope_{mode}_{int(use_temp_tables)}_{int(keep_disconnected)}_{int(fail_restore)}"
+    param = {
+        "use_temp_tables": use_temp_tables,
+        "suffix_override": suffix,
+        "setup_sql": [
+            "CREATE TABLE public.scope_parent (id INT PRIMARY KEY)",
+            "CREATE TABLE public.scope_child (id INT PRIMARY KEY,"
+            " parent_id INT REFERENCES public.scope_parent(id))",
+            "CREATE TABLE sales.scope_excluded (id INT PRIMARY KEY,"
+            " customer_id INT REFERENCES sales.customers(id))",
+        ],
+        "config_overrides": {
+            "keep_disconnected_tables": keep_disconnected,
+            "excluded_tables": ["sales.scope_excluded"],
+        },
+    }
+    source_db = SOURCE_DB + suffix
+    dest_db = DEST_DB + suffix
+
+    def constraints():
+        with _admin_conn(dest_db) as dest:
+            return dict(
+                dest.execute(
+                    "SELECT ns.nspname || '.' || cl.relname, con.oid"
+                    " FROM pg_constraint con"
+                    " JOIN pg_class cl ON cl.oid = con.conrelid"
+                    " JOIN pg_namespace ns ON ns.oid = cl.relnamespace"
+                    " WHERE con.contype = 'f' AND con.conname IN ("
+                    " 'scope_child_parent_id_fkey', 'scope_excluded_customer_id_fkey',"
+                    " 'scope_destination_only_customer_id_fkey', 'orders_customer_id_fkey')"
+                ).fetchall()
+            )
+
+    outside = {"sales.scope_excluded", "public.scope_destination_only"}
+    if not keep_disconnected:
+        outside.add("public.scope_child")
+    try:
+        _run_subsetter(**param)
+        with _admin_conn(dest_db) as dest:
+            dest.execute(
+                "CREATE TABLE public.scope_destination_only (id INT PRIMARY KEY,"
+                " customer_id INT REFERENCES sales.customers(id))"
+            )
+        before = constraints()
+        real_drop = psql_database_helper.drop_fk_constraints
+        real_restore = psql_database_helper.restore_fk_constraints
+        observed = []
+
+        def check_drop(*args):
+            definitions = real_drop(*args)
+            during = constraints()
+            assert {t: during.get(t) for t in outside} == {
+                t: before[t] for t in outside
+            }
+            assert "sales.orders" not in during
+            if keep_disconnected:
+                assert "public.scope_child" not in during
+            assert not outside.intersection(f"{s}.{t}" for s, t, _, _ in definitions)
+            observed.append(True)
+            return definitions
+
+        def restore_failure(*args):
+            raise RuntimeError("scoped restore failure")
+
+        monkeypatch.setattr(psql_database_helper, "drop_fk_constraints", check_drop)
+        if fail_restore:
+            monkeypatch.setattr(
+                psql_database_helper, "restore_fk_constraints", restore_failure
+            )
+            with pytest.raises(RuntimeError, match="scoped restore failure"):
+                _run_subsetter(**param, mode=mode)
+            after_failure = constraints()
+            assert {t: after_failure.get(t) for t in outside} == {
+                t: before[t] for t in outside
+            }
+            with _admin_conn(dest_db) as dest:
+                assert _query_one(
+                    dest, "SELECT to_regnamespace('_condenser') IS NOT NULL"
+                )
+            monkeypatch.setattr(
+                psql_database_helper, "restore_fk_constraints", real_restore
+            )
+        _run_subsetter(**param, mode=mode)
+        after = constraints()
+        assert observed
+        assert {t: after[t] for t in outside} == {t: before[t] for t in outside}
+        assert "sales.orders" in after
+        assert "public.scope_child" in after
+        with _admin_conn(dest_db) as dest:
+            assert _query_one(dest, "SELECT to_regnamespace('_condenser') IS NULL")
+            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+                dest.execute("INSERT INTO sales.scope_excluded VALUES (1, 999)")
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
+def test_scoped_fk_drop_recovers_legacy_unrelated_backups(monkeypatch):
+    param = {
+        "use_temp_tables": False,
+        "suffix_override": "_legacy_fk_scope",
+        "setup_sql": [
+            "CREATE TABLE public.legacy_parent (id INT PRIMARY KEY)",
+            "CREATE TABLE public.legacy_missing (id INT PRIMARY KEY,"
+            " parent_id INT REFERENCES public.legacy_parent(id))",
+            "CREATE TABLE public.legacy_live (id INT PRIMARY KEY,"
+            " parent_id INT REFERENCES public.legacy_parent(id))",
+        ],
+        "config_overrides": {"keep_disconnected_tables": False},
+    }
+    source_db = SOURCE_DB + param["suffix_override"]
+    dest_db = DEST_DB + param["suffix_override"]
+    try:
+        _run_subsetter(**param)
+        real_restore = psql_database_helper.restore_fk_constraints
+
+        def fail_restore(*args):
+            raise RuntimeError("legacy restore failure")
+
+        monkeypatch.setattr(
+            psql_database_helper, "restore_fk_constraints", fail_restore
+        )
+        with pytest.raises(RuntimeError, match="legacy restore failure"):
+            _run_subsetter(**param, mode="grow")
+        monkeypatch.setattr(
+            psql_database_helper, "restore_fk_constraints", real_restore
+        )
+        with _admin_conn(dest_db) as dest:
+            dest.execute(
+                "INSERT INTO _condenser.fk_backup"
+                " SELECT ns.nspname, cl.relname, con.conname, pg_get_constraintdef(con.oid)"
+                " FROM pg_constraint con"
+                " JOIN pg_class cl ON cl.oid = con.conrelid"
+                " JOIN pg_namespace ns ON ns.oid = cl.relnamespace"
+                " WHERE con.contype = 'f' AND ns.nspname = 'public'"
+                " AND cl.relname IN ('legacy_missing', 'legacy_live')"
+                " ON CONFLICT DO NOTHING"
+            )
+            live_oid = _query_one(
+                dest,
+                "SELECT oid FROM pg_constraint WHERE conname = 'legacy_live_parent_id_fkey'",
+            )
+            dest.execute(
+                "ALTER TABLE public.legacy_missing DROP CONSTRAINT legacy_missing_parent_id_fkey"
+            )
+        _run_subsetter(**param, mode="grow")
+        with _admin_conn(dest_db) as dest:
+            assert (
+                _query_one(
+                    dest,
+                    "SELECT oid FROM pg_constraint WHERE conname = 'legacy_live_parent_id_fkey'",
+                )
+                == live_oid
+            )
+            assert (
+                _query_one(
+                    dest,
+                    "SELECT count(*) FROM pg_constraint WHERE conname = 'legacy_missing_parent_id_fkey'",
+                )
+                == 1
+            )
+            assert _query_one(dest, "SELECT to_regnamespace('_condenser') IS NULL")
+    finally:
+        _drop_test_databases(source_db, dest_db)
+
+
 def test_fk_restore_failure_retains_journal(monkeypatch):
     param = {
         "use_temp_tables": False,
@@ -1713,7 +1847,7 @@ def test_fk_restore_failure_retains_journal(monkeypatch):
     dest_db = DEST_DB + "_resume_fk"
     try:
         source_db, dest_db = _run_subsetter(**param)
-        helper = database_helper.get_specific_helper()
+        helper = psql_database_helper
         real_restore = helper.restore_fk_constraints
 
         def fail_restore(*args, **kwargs):
@@ -2591,7 +2725,7 @@ def test_failed_history_grow_rejects_partial_config_edits(monkeypatch):
         source_db, dest_db = _run_subsetter(**param)
         _apply_audit_history_mutations(source_db)
 
-        helper = database_helper.get_specific_helper()
+        helper = psql_database_helper
         real_update_sequences = helper.update_sequence_numbering
 
         def fail_after_transfer(*args, **kwargs):
@@ -2757,7 +2891,7 @@ def multi_fk_batch_dbs():
     IDs, a streamed join that binds the same batch to both constraints drops
     every ring edge whose ends fall in different batches.
     """
-    import db_condenser.subset as subset_mod
+    from db_condenser.backends import downstream, execution, upstream
 
     source_db = SOURCE_DB + "_mfk"
     dest_db = DEST_DB + "_mfk"
@@ -2815,27 +2949,18 @@ def multi_fk_batch_dbs():
     config_reader.config = config_reader._raw_dict_to_config(raw_config)
     config = config_reader.get_config()
 
-    real_batch_size = subset_mod.compute_batch_size
-    subset_mod.compute_batch_size = lambda column_count: 2
+    # The same two-row stress batch now applies at the extracted SQL sites.
+    real_batch_sizes = {
+        module: module.compute_batch_size
+        for module in (downstream, execution, upstream)
+    }
+    for module in real_batch_sizes:
+        module.compute_batch_size = lambda column_count: 2
     try:
-        source_dbc = DbConnect(config.db_type, config.source_db_connection_info)
-        destination_dbc = DbConnect(
-            config.db_type, config.destination_db_connection_info
-        )
-        database = db_creator(config.db_type, source_dbc, destination_dbc)
-        database.teardown()
-        database.create()
-        db_helper = database_helper.get_specific_helper()
-        all_tables = db_helper.list_all_tables(source_dbc)
-        subsetter = Subset(source_dbc, destination_dbc, all_tables)
-        try:
-            subsetter.prep_temp_dbs()
-            subsetter.run_middle_out()
-        finally:
-            subsetter.unprep_temp_dbs()
-            subsetter.close_connections()
+        run_subset(config, report=False)
     finally:
-        subset_mod.compute_batch_size = real_batch_size
+        for module, real_batch_size in real_batch_sizes.items():
+            module.compute_batch_size = real_batch_size
 
     dest = psycopg.connect(
         dbname=dest_db,

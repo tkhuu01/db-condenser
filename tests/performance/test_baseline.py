@@ -25,6 +25,7 @@ from psycopg import sql
 
 from db_condenser import config_reader
 from db_condenser.db_connect import DbConnect
+from db_condenser.runner import _subset_run
 from db_condenser.subset import Subset
 
 
@@ -103,16 +104,8 @@ def worker(source_name, destination_name, mode):
         DbConnect(config.db_type, config.destination_db_connection_info),
         ["public.parent", "public.child"],
     )
-    succeeded = False
-    try:
-        subset.prep_temp_dbs()
-        subset.run_middle_out()
-        succeeded = True
-    finally:
-        try:
-            subset.unprep_temp_dbs(succeeded)
-        finally:
-            subset.close_connections()
+    with _subset_run(subset):
+        pass
     if sys.platform.startswith("linux"):
         # ru_maxrss can inherit the pytest parent's high-water mark at fork;
         # /proc reports this worker's post-exec address space instead.

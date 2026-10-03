@@ -149,7 +149,7 @@ def test_incremental_restores_fks_before_dropping_or_retaining_journal(
     session.finish(succeeded)
     assert helpers.mock_calls == [
         call.prep_incremental(session.source, session.destination, ["public.parent"]),
-        call.drop_fk_constraints(session.destination),
+        call.drop_fk_constraints(session.destination, ["public.parent"]),
         call.rollback(),
         call.restore_fk_constraints(
             session.destination, helpers.drop_fk_constraints.return_value

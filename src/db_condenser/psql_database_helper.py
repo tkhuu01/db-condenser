@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import uuid
+from contextlib import closing
 from dataclasses import asdict
 
 from psycopg import sql
@@ -585,8 +586,8 @@ def has_secondary_unique(table):
     return table in _secondary_unique_tables
 
 
-def drop_fk_constraints(conn):
-    """Capture and drop all FK constraints on the destination.
+def drop_fk_constraints(conn, tables: list[str]):
+    """Capture and drop FKs owned by participating destination tables.
 
     Incremental runs load into a destination whose constraints are live
     (added at the end of the first run), but middle-out ordering inserts
@@ -602,9 +603,10 @@ def drop_fk_constraints(conn):
           JOIN pg_namespace ns ON ns.oid = cl.relnamespace
          WHERE con.contype = 'f'
            AND ns.nspname NOT IN ('pg_catalog', 'information_schema')
+           AND ns.nspname || '.' || cl.relname = ANY(%s)
     """
     with conn.cursor() as cur:
-        cur.execute(q)
+        cur.execute(q, (tables,))
         fks = cur.fetchall()
         for nsp, rel, name, defn in fks:
             cur.execute(
@@ -627,6 +629,9 @@ def drop_fk_constraints(conn):
                     " the current constraint; remove the conflicting constraint"
                     " before retrying".format(nsp, rel, name)
                 )
+        # Older journals may contain unrelated FKs already dropped by a failed
+        # run. Keep those definitions for restoration without dropping live FKs
+        # outside the current table scope.
         cur.execute(
             "SELECT schema_name, table_name, constraint_name, definition FROM"
             ' "{}"."fk_backup" ORDER BY schema_name, table_name, constraint_name'.format(
@@ -1254,8 +1259,7 @@ def list_all_user_schemas(conn):
 
 
 def list_all_tables(db_connect):
-    conn = db_connect.get_db_connection()
-    with conn.cursor() as cur:
+    with closing(db_connect.get_db_connection()) as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT concat(concat(nsp.nspname,'.'),cls.relname)
               FROM pg_class cls
