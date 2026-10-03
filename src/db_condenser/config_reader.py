@@ -313,15 +313,19 @@ def _raw_dict_to_config(raw_config: dict) -> Config:
     )
 
 
-def initialize(file_name: str):
+def load_config(file_name: str | os.PathLike[str]) -> Config:
+    with open(file_name, "r") as fp:
+        raw_config = json.load(fp)
+
+    return _raw_dict_to_config(raw_config)
+
+
+def initialize(file_name: str | os.PathLike[str]):
     global config
     if config:
         print("WARNING: Attempted to initialize configuration twice.", file=sys.stderr)
 
-    with open(file_name, "r") as fp:
-        raw_config = json.load(fp)
-
-    config = _raw_dict_to_config(raw_config)
+    config = load_config(file_name)
 
 
 def get_config() -> Config:

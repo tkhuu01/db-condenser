@@ -10,6 +10,16 @@ from db_condenser import config_reader
 CONFIG_JSON = Path(__file__).parents[1] / "psql" / "test_config.json"
 
 
+def test_load_config_does_not_mutate_global(monkeypatch):
+    existing = object()
+    monkeypatch.setattr(config_reader, "config", existing)
+
+    loaded = config_reader.load_config(CONFIG_JSON)
+
+    assert loaded.db_type == config_reader.DbType.POSTGRES
+    assert config_reader.config is existing
+
+
 def test_skip_schema_setup_alias_maps_to_destination_mode():
     with open(CONFIG_JSON, "r") as fp:
         raw = json.load(fp)
