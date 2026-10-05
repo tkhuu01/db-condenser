@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, create_autospec
 
@@ -312,3 +313,15 @@ def test_cli_missing_file_does_not_start_run(monkeypatch, capsys):
     assert exc.value.code == 1
     assert "missing.json" in capsys.readouterr().err
     delegated.assert_not_called()
+
+
+def test_cli_config_help_from_checkout(monkeypatch, capsys, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "sys.argv", ["subset", "--help-config", "--config", "missing.json"]
+    )
+    direct_subset.main()
+    output = capsys.readouterr()
+    reference = Path(__file__).resolve().parents[2] / "CONFIG.md"
+    assert output.out == reference.read_text(encoding="utf-8")
+    assert output.err == ""

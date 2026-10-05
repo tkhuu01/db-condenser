@@ -4,8 +4,8 @@ Configuration must exist in `config.json`. Run `subset --example-config` to
 print a comprehensive example with all options (redirect it to get started:
 `subset --example-config > config.json`). Most of the configuration is
 straightforward:
-source and destination DB connection details and subsetting settings.
-There are three fields that deserve some additional attention.
+Source and destination DB connection details and subsetting settings.
+There are three fields that deserve some attention first.
 
 The first is `initial_targets`. This is where you tell the subsetter to begin
 the subset. You can specify any number of tables as an initial target, and
@@ -72,6 +72,7 @@ any targets.
 `max_rows_per_table`: A limit applied to all tables being copied. Useful if you
 have very large tables that you want a sampling from. Set to `"ALL"` for
 unlimited (recommended for most use cases). Default is no limit.
+NOTE: This config option is only used for the tables in `passthrough_tables`.
 
 ## Foreign key configuration
 
@@ -82,8 +83,8 @@ still preserve the foreign key relationship where possible without creating
 cycles.
 
 `fk_augmentation`: Additional foreign keys that, while not represented as
-constraints in the database, are logically present in the data. Foreign keys
-listed here are unioned with the foreign keys discovered from database
+constraints in the database, are logically present in the data or source code.
+Foreign keys listed here are unioned with the foreign keys discovered from database
 constraints. Each entry is a JSON object with `fk_table`, `fk_columns`,
 `target_table`, and `target_columns`. The column arrays must be the same
 length.
@@ -111,9 +112,10 @@ exactly one of `table` (filter applies to a specific table) or `column`
 
 `use_temp_tables`: If `true`, temporary ID tables will be created in the source
 database so that IDs are not stored in Python memory when batching 100k rows.
-This enables server-side JOINs, making subsetting more memory-efficient.
+This enables server-side JOINs, making subsetting more memory-efficient at the
+cost of some performance hits on the total amount of time it takes to fully subset.
 Requires write access on the source database (for `CREATE TEMPORARY TABLE`).
-Default is `false`.
+Default is `false`. 
 
 `parallel_read_workers`: Number of parallel connections used to read direct
 target tables from the source. Splits work by physical page ranges (ctid),
@@ -145,8 +147,7 @@ With `"topup"` (Postgres only), the destination is treated as an existing
 subset and the run adds to it — for example, to add rows from different
 initial targets across multiple runs. Already-imported entities stay frozen:
 new source children of previously imported rows are not picked up. Re-runs
-cost O(new rows). The deprecated `skip_schema_setup: true` is equivalent to
-`"topup"`.
+cost O(new rows).
 
 With `"grow"` (Postgres only), the run does everything `"topup"` does and
 also picks up new children/descendants of already-imported rows, so the
@@ -228,6 +229,12 @@ already-imported entities must continue to arrive. `"topup"` intentionally
 freezes those entities and only follows history belonging to newly inserted
 direct targets. Also set `destination_mode` explicitly: omitting it defaults to
 `"recreate"`, which rebuilds the destination.
+
+The last important note on incremental modes like `"grow"` is that during mutation
+of the subsetted for local development, reusing for a deployed environment, or testing
+you may get data that diverges. Take for example the following:
+
+
 
 ## Post-processing
 

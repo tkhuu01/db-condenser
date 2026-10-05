@@ -1,6 +1,7 @@
 import argparse
 import sys
 from importlib import resources
+from pathlib import Path
 
 from db_condenser import config_reader, run_subset
 from db_condenser.config_reader import DbConnectInfo
@@ -37,7 +38,10 @@ def _parse_args():
 
 
 def _print_packaged_file(name: str):
-    print(resources.files("db_condenser").joinpath(name).read_text(), end="")
+    resource = resources.files("db_condenser").joinpath(name)
+    if name == "CONFIG.md" and not resource.is_file():
+        resource = Path(__file__).resolve().parents[2] / name
+    print(resource.read_text(encoding="utf-8"), end="")
 
 
 def _confirm_destination(dest_info: DbConnectInfo):
