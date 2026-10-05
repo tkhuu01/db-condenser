@@ -122,13 +122,3 @@ or 127.0.0.1
 
 `--example-config`: Print an example `config.json` with all options and exit.
 Useful as a starting point: `subset --example-config > config.json`.
-
-## Building packages
-
-Edit the configuration reference in the root `CONFIG.md`. The build backend
-includes it in the package so installed users can run `subset --help-config`.
-From a checkout, the CLI reads the root document directly. Build packages with:
-
-```bash
-uv build
-```
