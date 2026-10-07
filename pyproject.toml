@@ -4,7 +4,7 @@ description = "Config-driven database subsetting tool that creates representativ
 authors = [{ name = "Thomas Khuu" }]
 license = "MIT"
 license-files = ["LICENSE"]
-version = "1.7.0"
+version = "1.7.1"
 readme = "README.md"
 classifiers = [
     "Intended Audience :: Developers",
@@ -61,5 +61,14 @@ markers = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.11.0,<0.12.0"]
-build-backend = "uv_build"
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+only-include = ["src/db_condenser", "CONFIG.md", "README.md", "LICENSE", "pyproject.toml"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/db_condenser"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"CONFIG.md" = "db_condenser/CONFIG.md"

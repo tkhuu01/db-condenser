@@ -75,7 +75,7 @@ named `public.target_table`.
     There may be more required configuration depending on your database, but
     simple databases should be easy. Run `subset --help-config` for the full
     configuration reference (also in
-    [src/db_condenser/CONFIG.md](src/db_condenser/CONFIG.md)), and
+    [CONFIG.md](CONFIG.md)), and
     `subset --example-config` for all of the options in a single config file.
 
 6. Run! `$ uv run subset`
