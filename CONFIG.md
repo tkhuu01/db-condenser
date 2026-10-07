@@ -230,11 +230,16 @@ freezes those entities and only follows history belonging to newly inserted
 direct targets. Also set `destination_mode` explicitly: omitting it defaults to
 `"recreate"`, which rebuilds the destination.
 
-The last important note on incremental modes like `"grow"` is that during mutation
-of the subsetted for local development, reusing for a deployed environment, or testing
-you may get data that diverges. Take for example the following:
-
-
+If you edit the destination for local development or testing, `"topup"` and
+`"grow"` can leave a mix of local edits and source values. For example, after
+copying a product with `color = 'Black'`, you change its destination color to
+`'Red'`. If the next run re-reads that product (for example, it still matches
+the source filter `color = 'Black'`), the upsert restores `'Black'`, overwriting
+your local edit. A product that is not re-read keeps its local changes.
+Incremental modes are useful for expanding disposable development or test
+databases without rebuilding them, when some divergence from the source is acceptable.
+They do not guarantee preservation of local edits. Use `"recreate"` when you
+need a clean baseline.
 
 ## Post-processing
 
