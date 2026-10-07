@@ -4,7 +4,7 @@ description = "Config-driven database subsetting tool that creates representativ
 authors = [{ name = "Thomas Khuu" }]
 license = "MIT"
 license-files = ["LICENSE"]
-version = "1.7.0"
+version = "1.7.1"
 readme = "README.md"
 classifiers = [
     "Intended Audience :: Developers",
